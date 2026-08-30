@@ -1,0 +1,170 @@
+TRADEFLOW — PROJECT SPEC
+=========================
+
+NOTE ON THIS DOCUMENT
+---------------------
+This file was reconstructed by Bob (Builder) from the decisions, constraints,
+and wording captured in handoff/ARCHITECT-BRIEF.md (Step 1), because the
+original verbatim project spec was not available in this build session. It
+is believed to faithfully cover everything the brief itself relies on, but
+it is NOT a verified copy of the owner's original spec document. If a
+verbatim original exists, it should replace this file — see the open
+question logged in handoff/REVIEW-REQUEST.md.
+
+1. PRODUCT OVERVIEW
+--------------------
+TradeFlow is a price-alert and trading-reminder platform. A user creates
+alerts against a tradable instrument's price (V1: gold, symbol XAUUSD) and
+gets notified when the price crosses a target threshold. A related feature,
+graph reminders, lets a user schedule a reminder to review a given
+instrument's chart on a timeframe, at a recurring time in their own
+timezone. Notifications are intended to be delivered via Web Push to
+registered devices.
+
+2. TECH STACK
+-------------
+- Monorepo: Turborepo + pnpm workspaces.
+- Frontend: Next.js (App Router), TypeScript in strict mode.
+- Auth/session/database: Supabase (Postgres + Auth), accessed via
+  @supabase/ssr (not the older auth-helpers-nextjs package).
+- Validation: zod schemas that mirror the database's constraints exactly, so
+  invalid input is rejected before it ever reaches the database.
+- Local development targets a real Supabase free-tier cloud project directly
+  — no local Docker `supabase start` stack.
+
+3. DATA MODEL
+-------------
+profiles
+  - id (references auth.users, primary key)
+  - email
+  - timezone
+  - created_at, updated_at
+  Supabase's auth.users table is the sole source of truth for identity and
+  credentials. The app never creates its own users table.
+
+instruments
+  - id, symbol, name, asset_type, enabled
+  - last_price, last_price_at — the most recently observed tick for this
+    instrument. This is where the "previous price" used in alert-crossing
+    comparisons lives; there is no separate price-ticks/history table in V1.
+  - created_at
+  V1 ships with exactly one seeded row: XAUUSD / Gold / metal / enabled.
+
+price_alerts
+  - id, user_id, instrument_id
+  - target_price (must be > 0, no upper bound)
+  - direction: CROSS_UP | CROSS_DOWN | CROSS_BOTH
+  - trigger_mode: ONCE | EVERY_TIME
+  - expiration_at (nullable; if set, must be in the future at creation time)
+  - message (optional free text shown in the notification)
+  - enabled
+  - last_triggered_at (nullable; last time this alert fired)
+  - created_at, updated_at
+  No uniqueness constraint — a user may create duplicate/overlapping alerts.
+
+graph_reminders
+  - id, user_id, instrument_id
+  - timeframe: 15m | 1H | 4H | 1D
+  - description (optional)
+  - timezone (IANA name, e.g. "Asia/Kuala_Lumpur")
+  - enabled
+  - next_trigger_at
+  - created_at, updated_at
+
+devices
+  - id, user_id, platform (web | ios | android)
+  - subscription (JSONB) — holds a Web Push PushSubscription object
+    (endpoint + keys), not an FCM/Expo push token
+  - enabled, last_seen_at
+  - created_at, updated_at
+
+notification_log
+  - id, user_id, device_id
+  - event_type: PRICE_ALERT | GRAPH_REMINDER
+  - title, message
+  - status: SENT | FAILED | PENDING
+  - sent_at, created_at
+
+4. ROW LEVEL SECURITY
+----------------------
+Every user-owned table (profiles, price_alerts, graph_reminders, devices,
+notification_log) is restricted so a row is only visible/writable when
+auth.uid() equals that row's owner column (user_id, or id for profiles).
+instruments is readable by any authenticated user, but only writable by the
+service role (the service role is not used until Step 2, when the price
+feed starts writing last_price/last_price_at).
+
+5. ALERT ENGINE SEMANTICS
+--------------------------
+The alert engine is a pure, I/O-free function:
+
+    evaluatePriceAlert(alert, previousPrice, currentPrice, now) -> boolean
+
+Rules:
+  - CROSS_UP triggers when previousPrice < target AND currentPrice >= target.
+  - CROSS_DOWN triggers when previousPrice > target AND currentPrice <= target.
+  - CROSS_BOTH triggers on either of the above.
+  - A bare "currentPrice >= target" with no actual crossing (e.g. the price
+    was already above target on the previous tick) must NEVER trigger.
+  - ONCE mode fires on the first valid crossing only. The engine itself is
+    stateless — it does not mutate anything — so "don't fire again" is
+    expressed purely through the caller passing in the alert's current
+    last_triggered_at / enabled state as an input on each call.
+  - EVERY_TIME mode may fire again on a later, genuinely new crossing, but
+    must not fire again merely because price remains past the threshold
+    without re-crossing it.
+  - An alert whose expiration_at is in the past (relative to `now`) never
+    triggers.
+  - A disabled alert never triggers.
+
+Required test coverage (exactly these 8 cases):
+  1. CROSS_UP triggers: prev 3399 -> cur 3401, target 3400
+  2. CROSS_UP does NOT trigger without crossing: prev 3401 -> cur 3402, target 3400
+  3. CROSS_DOWN triggers: prev 3401 -> cur 3399, target 3400
+  4. CROSS_DOWN does NOT trigger without crossing: prev 3399 -> cur 3398, target 3400
+  5. ONCE: fires on first crossing, not on second
+  6. EVERY_TIME: fires on first AND a second independent crossing
+  7. Expired alert: never triggers
+  8. Disabled alert: never triggers
+
+6. MARKET DATA
+--------------
+A `MarketDataProvider` interface abstracts the price feed:
+
+    interface MarketDataProvider {
+      getPrice(instrument: string): Promise<PriceUpdate>;
+    }
+
+    interface PriceUpdate {
+      instrument: string;
+      price: number;
+      timestamp: string;
+      provider: string;
+    }
+
+V1's only concrete implementation is OANDA, but it requires the owner to
+have created an OANDA account and is out of scope until Step 2. The V1
+interface is defined with no concrete implementation and no placeholder
+stub file for it.
+
+7. ALERT MANAGEMENT UI
+------------------------
+A signed-in user can Create, View, Edit, Enable/Disable, and Delete price
+alerts against the single seeded instrument (XAUUSD) — the UI does not
+offer an instrument picker in V1, and editing an alert never changes which
+instrument it targets. Delete-and-recreate is explicitly not an acceptable
+substitute for Edit.
+
+8. OUT OF SCOPE FOR STEP 1
+---------------------------
+- Any concrete MarketDataProvider implementation (OANDA or otherwise).
+- Scheduled/cron-driven evaluation of alerts or reminders (pg_cron or any
+  equivalent).
+- Web Push subscription flow, VAPID key setup, and any push-notification UI.
+- Graph reminders UI (the table exists in the schema; no screens yet).
+
+9. COST / FREE TIER
+--------------------
+See README.md's "COST / FREE TIER" section for the current (Step 1)
+breakdown. OANDA and hosting costs will be documented there once they are
+introduced in Step 2.
