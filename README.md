@@ -6,21 +6,25 @@ monorepo. See `PROJECT_SPEC.txt` for the full product spec and
 
 ## Status
 
-**Step 1** — repo scaffold, schema, auth, alert CRUD, and the alert-engine
-core. No live price feed, cron, or push notifications yet (Step 2).
+**Step 2** — live OANDA price feed, the pg_cron-invoked "tick" Edge
+Function, Web Push notifications, and Cloudflare deploy scaffolding. See
+`handoff/BUILD-LOG.md` for exactly what's verified vs. still blocked on
+owner/Arch-side setup (a real OANDA token, function deploy, pg_cron/pg_net
+extension enablement, and an actual Cloudflare deploy).
 
 ## Structure
 
 ```
 apps/
-  web/                 Next.js app (auth, dashboard, alert CRUD)
+  web/                 Next.js app (auth, dashboard, alert CRUD, push subscribe)
 packages/
   types/               Shared TypeScript types
   validation/          zod schemas mirroring DB constraints
-  market-data/         MarketDataProvider interface (no implementation yet)
+  market-data/         MarketDataProvider interface + OANDAProvider implementation
   alert-engine/        Pure evaluatePriceAlert() + its Vitest suite
 supabase/
-  migrations/          SQL migrations (schema + RLS)
+  migrations/          SQL migrations (schema + RLS + pg_cron schedule)
+  functions/tick/      Edge Function: OANDA price -> alert/reminder evaluation -> Web Push
 docs/
   SETUP.md             Local setup instructions
 ```
@@ -62,5 +66,42 @@ free-tier terms can change.*
   self-host Supabase (Postgres + GoTrue) on a low-cost VPS. Neither is
   needed at V1's expected scale.
 
-**OANDA (price feed) and hosting:** not wired up yet. Cost/free-tier notes
-for these will be added here in Step 2 once they're introduced.
+**OANDA (price feed):**
+- Free tier includes: a practice/demo v20 REST API account is entirely
+  free, with no card required — this is what V1 uses exclusively
+  (`OANDA_ENV=practice`; no "live" trading-account code path exists). OANDA
+  does not publish a hard rate limit for the practice API, but the "tick"
+  Edge Function only calls it once per cron invocation (every 2 minutes ==
+  30 requests/hour), far below any plausible throttling threshold.
+- What happens if exceeded: if OANDA ever rate-limits or the practice
+  account lapses, `OANDAProvider.getPrice` throws a typed
+  `OANDAProviderError` (see `packages/market-data/src/oandaProvider.ts`);
+  the tick function catches it, logs the failure in its response summary,
+  and skips only that tick's price-alert evaluation — it does not crash,
+  and graph reminders (which don't need a price) still run that tick.
+- Potential paid cost: none at V1's scale — a real trading (live) account
+  is a different, unused product tier and is never touched by this app.
+- Alternative: any other FX/metals price API with a free tier (e.g.
+  Twelve Data, Alpha Vantage) could replace `OANDAProvider` behind the
+  existing `MarketDataProvider` interface without touching the alert-engine
+  or the Edge Function's evaluation logic.
+
+**Cloudflare (hosting — Workers via the OpenNext adapter, not classic
+Pages; see `handoff/REVIEW-REQUEST.md` for why):**
+- Free tier includes: 100,000 requests/day on Cloudflare's Workers Free
+  plan, 10ms of CPU time per request, and no bandwidth charge for static
+  assets served from the Workers Assets binding (`.open-next/assets`).
+  Comfortably covers V1's expected traffic (a handful of users' dashboards).
+- What happens if exceeded: requests beyond the daily free-tier cap are
+  rejected (HTTP 1015-style rate-limit response) until the daily quota
+  resets, or the account is prompted to upgrade — Cloudflare does not
+  silently bill on the Free plan.
+- Potential paid cost: the Workers Paid plan is $5/month (includes 10
+  million requests/month, then usage-based beyond that) if V1 ever outgrows
+  the free daily request cap.
+- Alternative: Vercel's free hobby tier (the "native" host for Next.js) is
+  the most direct swap if Cloudflare's Workers-not-Pages distinction (see
+  the open question in `handoff/REVIEW-REQUEST.md`) turns out to be
+  unwanted; the app has no Cloudflare-specific code paths beyond
+  `apps/web/wrangler.jsonc` and `open-next.config.ts`, so switching hosts
+  does not touch application logic.

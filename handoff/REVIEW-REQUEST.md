@@ -1,106 +1,181 @@
-# Review Request — Step 1
+# Review Request — Step 2
 *Written by Builder. Read by Reviewer.*
 
 Ready for Review: YES
 
 ---
 
-## Round 2 — Review Feedback Addressed (2026-08-30)
+## Review Fixes (2026-08-30, responding to Richard's round-1 Step 2 review)
 
-Both findings from `handoff/REVIEW-FEEDBACK.md` (2026-08-30, first pass) are fixed:
+All three findings from `handoff/REVIEW-FEEDBACK.md` addressed:
 
-- **Must Fix** — `apps/web/app/dashboard/alerts/[id]/edit/page.tsx:16-20` — added `.eq("user_id", user.id)` to the `price_alerts` select alongside `.eq("id", params.id)`, matching the app-side scoping pattern used by every other `price_alerts` query in `apps/web/app/dashboard/actions.ts`. Closes the gap where this one read relied on RLS alone.
-- **Should Fix** — `apps/web/app/dashboard/actions.ts:34-51` (`readAlertFormFields`) — now checks `Number.isNaN(parsed.getTime())` before calling `.toISOString()` on the parsed expiration date; an unparseable string is passed through raw so the zod schema's `expirationMustBeFuture` refine rejects it with a friendly validation error instead of the action throwing an uncaught `RangeError`.
+1. **Must Fix (SSRF)** — `packages/validation/src/device.ts`'s `webPushSubscriptionSchema.endpoint`
+   now goes through a new `pushEndpointSchema` (`z.string().url().superRefine(...)`) that parses
+   the URL and rejects anything whose scheme isn't exactly `https:`, then rejects any hostname not
+   in an allowlist of real Web Push service hosts: exact match for `fcm.googleapis.com`,
+   `updates.push.services.mozilla.com`, `web.push.apple.com`, and a suffix match
+   (`hostname.endsWith(".notify.windows.com")`) for Edge/Windows WNS endpoints. Added
+   `packages/validation/src/__tests__/device.test.ts` (new — 9 cases covering a valid endpoint for
+   each allowlisted host, http-on-a-valid-host, a non-allowlisted https host — the actual SSRF
+   case — a malformed URL, a `file:` scheme, and a lookalike-substring host). This required adding
+   `vitest`/`vitest.config.ts`/a `test` script to `packages/validation/package.json` (it had no
+   test infra before), matching the existing `alert-engine`/`market-data` pattern.
+2. **Should Fix** — `apps/web/app/dashboard/page.tsx`'s alerts query now has `.eq("user_id", user.id)`,
+   matching the pattern used everywhere else in `actions.ts` and the now-fixed `edit/page.tsx`.
+3. **Documentation gap** — the Files Changed table below now includes `supabase/config.toml` and
+   `supabase/.gitignore`.
 
-No other files touched — scope-locked to these two fixes per Richard's feedback.
-
-Verification (repo root, after fix): `pnpm build`, `pnpm test`, `pnpm typecheck` all pass. See `handoff/BUILD-LOG.md` "Review Fixes" entry for details.
+Verified after fix: `pnpm install`, `pnpm build`, `pnpm test` (23 tests: 8 alert-engine + 6
+market-data + 9 validation, all pass), `pnpm typecheck` — all green at repo root. Full narrative
+in `handoff/BUILD-LOG.md`'s Step 2 "Review Fixes" entry.
 
 **Ready for Review: YES**
 
 ---
 
+## Context: continuation session
+
+A prior Bob instance's process exited unexpectedly partway through Step 2. It had
+already built and left in a working state (verified building/passing before this
+session started): `packages/market-data/src/oandaProvider.ts` + its 6-test Vitest
+suite, the full `supabase/functions/tick/index.ts` + `nextTrigger.ts` (+ its Deno
+test) logic, and `supabase/functions/deno.json`. It had NOT yet run the
+`supabase functions serve` local verification (Build Order item 2), logged
+anything to `handoff/BUILD-LOG.md`, or done Build Order items 3-8. This session
+picked up exactly there — verified the prior work, then finished the rest of the
+step. See `handoff/BUILD-LOG.md`'s Step 2 entry for the full verification
+narrative (a real Windows/Docker-Desktop `supabase functions serve` limitation
+was hit and worked around; details there).
+
 ## What Was Built
 
-A Turborepo + pnpm monorepo for TradeFlow: four TypeScript packages
-(`types`, `validation`, `market-data`, `alert-engine`), a Next.js App Router
-web app with Supabase-backed auth and full price-alert CRUD against a
-single seeded XAUUSD instrument, two SQL migrations (schema + RLS), a
-Playwright e2e spec, and the required top-level docs. Everything that does
-not require a live Supabase project has been built and verified locally
-(`pnpm install`, `pnpm build`, `pnpm test`, `pnpm typecheck` all pass — see
-`handoff/BUILD-LOG.md` for exact commands/output). The final
-live-credential verification steps (dev server boot, manual CRUD
-walkthrough, two-user RLS check, live Playwright run) are blocked on the
-owner creating the Supabase project — see Known Gaps.
+- **OANDA live price feed** (already built by the prior session, verified
+  working this session, not modified): `packages/market-data/src/oandaProvider.ts`
+  implements `MarketDataProvider` against OANDA's v20 pricing endpoint, using
+  `closeoutBid`/`closeoutAsk` (verified against OANDA's own docs, not guessed —
+  see the file's comments for why these fields over `bids[0]`/`asks[0]`).
+- **The `tick` Edge Function** (already built, verified end-to-end this session
+  against a local Supabase stack, one scaffold removed): per cron invocation,
+  fetches OANDA's price, evaluates every enabled/unexpired `price_alerts` row via
+  the real (imported, not reimplemented) `evaluatePriceAlert`, evaluates due
+  `graph_reminders`, sends Web Push via `npm:web-push`, logs to
+  `notification_log`, and unconditionally updates `instruments.last_price`.
+- **`pg_cron` schedule** (`supabase/migrations/0003_cron.sql`, new this session):
+  `cron.schedule` + `net.http_post` every 2 minutes, with the function URL and
+  service-role token read from Supabase Vault rather than inlined in the
+  migration. Applies cleanly; cannot fire for real until the function is
+  deployed and `pg_cron`/`pg_net` are enabled on the real project (owner-side).
+- **VAPID keypair + env wiring** (new this session): a real keypair generated
+  locally via `npx web-push generate-vapid-keys` (no external account), wired
+  into `.env.local.example` files (fake placeholders) and used for real in
+  `apps/web/.env.local`/`supabase/functions/.env.local` (both untracked) to
+  actually exercise the push flow live.
+- **Web Push subscribe flow** (new this session): `apps/web/public/sw.js`
+  (push + notificationclick handlers), `apps/web/app/dashboard/notifications-control.tsx`
+  ("Enable notifications" client-component island on the dashboard),
+  `apps/web/app/dashboard/device-actions.ts` (server action upserting the
+  subscription into `devices`, scoped to `auth.uid()`, mirroring the existing
+  `actions.ts` defense-in-depth pattern), and `packages/validation/src/device.ts`
+  (new `upsertDeviceSchema`/`webPushSubscriptionSchema`, following the existing
+  `createPriceAlertSchema` pattern). Verified live against the real cloud
+  Supabase project (see Open Questions for the one thing that had to be
+  stubbed, and why).
+- **Cloudflare deploy scaffolding** (new this session): `apps/web/wrangler.jsonc`,
+  `apps/web/open-next.config.ts`, `apps/web/.dev.vars.example`, and `cf:preview`/
+  `cf:deploy` scripts, using `@opennextjs/cloudflare` **pinned to `1.15.1`**
+  (see Open Questions — the latest published version silently requires Next.js
+  15+ and would have been a real, unplanned breaking-change risk). No deploy
+  attempted — no confirmed Cloudflare account.
+- **Docs**: `README.md`'s COST/FREE TIER section gained OANDA and Cloudflare
+  entries; `docs/SETUP.md` gained VAPID generation, local Edge Function serve
+  instructions (including the Windows/Docker workaround), and Cloudflare
+  preview/deploy instructions.
 
 ## Files Changed
 
-| File | Lines | Change |
-|---|---|---|
-| `package.json` | 1-21 | Root workspace manifest: pnpm workspaces, turbo scripts, pinned `packageManager`. |
-| `pnpm-workspace.yaml` | 1-3 | Declares `apps/*` and `packages/*` as workspace packages. |
-| `turbo.json` | 1-24 | Turborepo pipeline: build/dev/test/lint/typecheck tasks with cache outputs. |
-| `tsconfig.base.json` | 1-18 | Shared strict TS compiler options extended by every package. |
-| `.gitignore` | 1-45 | Excludes node_modules/.next/.turbo/.env.local and local agent-tooling dirs (`.claude/`, `.token-optimizer/`, `_temp/`) that predate this step and aren't project content. |
-| `.editorconfig` | 1-12 | Consistent indentation/line-ending rules across editors. |
-| `packages/types/src/enums.ts` | 1-18 | Literal-union enum types mirroring the DB CHECK constraints. |
-| `packages/types/src/instrument.ts` | 1-17 | `Instrument` type matching the `instruments` table. |
-| `packages/types/src/priceAlert.ts` | 1-19 | `PriceAlert` type matching the `price_alerts` table. |
-| `packages/types/src/graphReminder.ts` | 1-17 | `GraphReminder` type matching the `graph_reminders` table. |
-| `packages/types/src/device.ts` | 1-30 | `Device` type + `WebPushSubscriptionJson` shape for the `subscription` JSONB column. |
-| `packages/types/src/notificationLog.ts` | 1-16 | `NotificationLog` type matching the `notification_log` table. |
-| `packages/types/src/priceUpdate.ts` | 1-11 | `PriceUpdate` tick shape consumed by the alert engine and market-data provider. |
-| `packages/types/src/index.ts` | 1-7 | Barrel export for the package. |
-| `packages/types/package.json`, `tsconfig.json` | — | Package manifest/TS config. |
-| `packages/validation/src/enums.ts` | 1-13 | zod mirrors of the direction/trigger_mode/timeframe enums. |
-| `packages/validation/src/priceAlert.ts` | 1-54 | `createPriceAlertSchema` / `updatePriceAlertSchema`: `target_price > 0`, `expiration_at` must be future-or-null, enum validation. |
-| `packages/validation/src/auth.ts` | 1-20 | Signup/login form schemas (email format, min password length). |
-| `packages/validation/src/index.ts` | 1-3 | Barrel export. |
-| `packages/validation/package.json`, `tsconfig.json` | — | Package manifest/TS config. |
-| `packages/market-data/src/provider.ts` | 1-13 | `MarketDataProvider` interface only — no concrete implementation, per the brief's flag. |
-| `packages/market-data/src/index.ts`, `package.json`, `tsconfig.json` | — | Barrel export + package manifest/TS config. |
-| `packages/alert-engine/src/evaluatePriceAlert.ts` | 1-67 | The pure, I/O-free crossing-evaluation function — implements CROSS_UP/CROSS_DOWN/CROSS_BOTH, ONCE/EVERY_TIME, expiration, and disabled-alert rules exactly as specified. |
-| `packages/alert-engine/src/__tests__/evaluatePriceAlert.test.ts` | 1-86 | The 8 required Vitest cases, named to match the brief's wording; all pass. |
-| `packages/alert-engine/src/index.ts`, `package.json`, `tsconfig.json`, `vitest.config.ts` | — | Barrel export, package manifest, TS config, Vitest config. |
-| `supabase/migrations/0001_init.sql` | 1-168 | Schema: `profiles`, `instruments` (seeded with one XAUUSD row), `price_alerts`, `graph_reminders`, `devices`, `notification_log`; `updated_at` trigger helper; a `handle_new_user` trigger auto-provisioning a `profiles` row on signup (see Open Questions). |
-| `supabase/migrations/0002_rls.sql` | 1-128 | RLS: `auth.uid() = user_id`/`id` policies on every user-owned table; `instruments` readable by any authenticated user, no client write policy (service-role only, unused until Step 2). |
-| `apps/web/package.json`, `tsconfig.json`, `next.config.mjs`, `next-env.d.ts` | — | Next.js app manifest/config; `transpilePackages` for the workspace packages. |
-| `apps/web/middleware.ts`, `lib/supabase/middleware.ts` | 1-19, 1-40 | Refreshes the Supabase session cookie on every request (standard `@supabase/ssr` pattern). |
-| `apps/web/lib/supabase/client.ts` | 1-12 | Browser Supabase client factory. |
-| `apps/web/lib/supabase/server.ts` | 1-36 | Server Supabase client factory for Server Components/Actions. |
-| `apps/web/app/layout.tsx`, `globals.css` | 1-15, 1-159 | Root layout + minimal shared styling (no design system pulled in). |
-| `apps/web/app/page.tsx` | 1-31 | Landing page: redirects to `/dashboard` if already signed in, else links to login/signup. |
-| `apps/web/app/login/page.tsx` | 1-49 | Login form (client component, `useFormState`). |
-| `apps/web/app/signup/page.tsx` | 1-51 | Signup form; shows a "check your email" notice if email confirmation is enabled on the project. |
-| `apps/web/app/auth/actions.ts` | 1-73 | Server actions: `signUpAction`, `logInAction`, `logOutAction`. |
-| `apps/web/app/auth/callback/route.ts` | 1-23 | Exchanges the Supabase email-confirmation code for a session. |
-| `apps/web/app/dashboard/page.tsx` | 1-115 | Alert list: table with instrument/target/direction/mode/expiry/status, Edit link, Enable/Disable and Delete forms, sign-out. |
-| `apps/web/app/dashboard/actions.ts` | 1-149 | Server actions: `createAlertAction`, `updateAlertAction`, `setAlertEnabledAction`, `deleteAlertAction` — all validated via `@tradeflow/validation`, all scoped to the current user. |
-| `apps/web/app/dashboard/alerts/new/page.tsx` | 1-82 | Create-alert form. |
-| `apps/web/app/dashboard/alerts/[id]/edit/page.tsx` | 1-31 | Server component: fetches the alert by id (RLS-scoped) and renders the edit form. |
-| `apps/web/app/dashboard/alerts/[id]/edit/edit-form.tsx` | 1-97 | Client edit form, pre-filled, bound to `updateAlertAction`. |
-| `apps/web/.env.local.example` | 1-7 | Documents the two required env var names with obviously-fake placeholder values; never a real-looking secret. |
-| `apps/web/playwright.config.ts` | 1-26 | Playwright config: single chromium project, auto-starts `pnpm dev`. |
-| `apps/web/e2e/alert-crud.spec.ts` | 1-56 | Signup → logout → login → create → edit → delete flow for one alert. |
-| `PROJECT_SPEC.txt` | 1-170 | Reconstructed project spec (see Open Questions — not a verified verbatim original). |
-| `README.md` | 1-66 | Repo overview + COST/FREE TIER section for Supabase. |
-| `AGENTS.md` | 1-13 | Pointer doc: read `PROJECT_SPEC.txt`, then the relevant role file. |
-| `docs/SETUP.md` | 1-72 | Local setup steps, including the "disable Confirm email" note needed for the e2e test to work. |
-| `handoff/BUILD-LOG.md`, `handoff/ARCHITECT-BRIEF.md` (Builder Plan section) | — | Step-1 log entry and the pre-build plan Arch approved implicitly per this run's instructions. |
+| File | Change |
+|---|---|
+| `packages/market-data/src/oandaProvider.ts`, `src/__tests__/oandaProvider.test.ts`, `vitest.config.ts`, `package.json`, `src/index.ts` | Built by the prior session; verified working, not modified this session. |
+| `supabase/functions/tick/index.ts` | Built by the prior session. This session removed the `TEMP-LOCAL-VERIFY` `fetchFn` mock-redirect scaffold from `buildOandaProvider()` (per its own comment) after using it to verify locally — see BUILD-LOG. No other logic changes. |
+| `supabase/functions/tick/nextTrigger.ts`, `nextTrigger.test.ts`, `supabase/functions/deno.json` | Built by the prior session; verified working, not modified. |
+| `supabase/functions/deno.lock` | New — Deno's lockfile, generated as a byproduct of `deno check`/`deno run` during verification. Kept and tracked for reproducible `npm:` specifier resolution, same rationale as `pnpm-lock.yaml`. |
+| `supabase/functions/.env.local.example` | New — tracked, fake-placeholder template for the Edge Function's local secrets (OANDA + VAPID names), mirroring `apps/web/.env.local.example`'s pattern. |
+| `supabase/migrations/0003_cron.sql` | New — pg_cron schedule calling the tick function via pg_net, secrets via Supabase Vault. Applies cleanly locally; not run against the real project (see Blocked items in BUILD-LOG). |
+| `packages/validation/src/device.ts`, `src/index.ts` | New — `webPushSubscriptionSchema`/`upsertDeviceSchema`, exported from the barrel. |
+| `apps/web/public/sw.js` | New — minimal service worker: `push` shows a notification, `notificationclick` focuses/opens `/dashboard`. |
+| `apps/web/app/dashboard/notifications-control.tsx` | New — client component: registers the service worker, requests permission, subscribes, calls the server action. Never surfaces raw browser/network errors, only friendly status text. |
+| `apps/web/app/dashboard/device-actions.ts` | New — `upsertDeviceAction`: validates via zod, then application-level upsert (find-by-endpoint, update-or-insert) scoped to `auth.uid()`, using the anon-key request-scoped client (never service role). |
+| `apps/web/app/dashboard/page.tsx` | Added `<NotificationsControl />` to the dashboard, between the top bar and the alerts table. |
+| `apps/web/.env.local.example` | Added `NEXT_PUBLIC_VAPID_PUBLIC_KEY` (fake placeholder). |
+| `apps/web/.dev.vars.example` | New — tracked template for wrangler's local dev vars. |
+| `apps/web/wrangler.jsonc`, `open-next.config.ts` | New — Cloudflare Workers (via OpenNext) build config. No R2/KV bindings configured (no ISR/SSG pages need one in V1). |
+| `apps/web/package.json` | Added `@opennextjs/cloudflare` (pinned `1.15.1`, not latest — see Open Questions) and `wrangler` devDependencies; added `cf:preview`/`cf:deploy` scripts (left `build`/`dev`/`start` untouched). |
+| `.gitignore` | Added `.dev.vars`, `.open-next/`, `.wrangler/`. |
+| `supabase/config.toml` | New — `supabase init` scaffolding; local Supabase CLI/stack config. No secrets (only commented-out `env(...)` placeholders). |
+| `supabase/.gitignore` | New — `supabase init` scaffolding; excludes local CLI state (`.branches`, `.temp`, etc.) from version control. |
+| `README.md` | Status/Structure sections updated for Step 2; COST/FREE TIER gained OANDA and Cloudflare entries per spec section 37. |
+| `docs/SETUP.md` | Added: VAPID keypair generation + env var placement, local Edge Function serve instructions (including the Windows/Docker `supabase functions serve` workaround), Cloudflare preview/deploy instructions. |
+| `handoff/BUILD-LOG.md` | Step 2 entry: what was verified, how, key decisions, and everything explicitly blocked. |
 
 ## Open Questions
 
-1. **`PROJECT_SPEC.txt` provenance** — I did not have the owner's original verbatim spec text in this session, per Arch's instructions. I reconstructed it from everything `handoff/ARCHITECT-BRIEF.md` states about the product, schema, alert-engine semantics, and UI scope. I'm reasonably confident it's complete relative to what this step needed, but it is **not verified against an original document**. If one exists, please supply it and I'll replace this file verbatim.
-2. **`handle_new_user` trigger on `auth.users`** (`supabase/migrations/0001_init.sql`) — the brief specifies the `profiles` table but doesn't say how rows get into it. Without some mechanism, `profiles` would stay permanently empty. I added a `security definer` trigger that inserts a `profiles` row whenever a new `auth.users` row is created. This is standard Supabase practice, but it's a decision I made without explicit instruction — flagging in case Arch wants it handled differently (e.g. explicit app-side insert instead of a DB trigger).
-3. **No generated Supabase `Database` type** — query results from `apps/web` are typed via manual `.returns<T>()` casts against `@tradeflow/types`, since `supabase gen types typescript` needs a live project to introspect. Once the project exists this should probably be regenerated and swapped in; logged as KG-2 in BUILD-LOG.
-4. **Internal package imports use extensionless specifiers** (e.g. `./enums` not `./enums.js`) rather than the more common Node-ESM `.js`-suffixed style — this was required to get Next.js's webpack bundler to resolve `@tradeflow/*` workspace packages (consumed as raw TS via `transpilePackages`, not pre-built `dist/`). Confirmed working via a full `pnpm build`. Flagging as a stack-level pattern worth keeping consistent going forward, not something to "fix" back to `.js` extensions.
-5. **Versions not pinned by the brief** (pnpm 9.12.3, Next.js ^14.2.15, @supabase/ssr ^0.5.2, @supabase/supabase-js ^2.45.4, zod ^3.23.8, Vitest ^2.1.4, @playwright/test ^1.48.0, React 18.3.1) were chosen as current-stable at build time; happy to bump if Arch has different preferences.
+1. **`VAPID_SUBJECT`'s real `mailto:` address** — the brief says to ask the
+   owner if not already documented; it isn't documented anywhere in this repo.
+   Used `mailto:fake-placeholder@example.com` in tracked `.env.local.example`
+   files and `mailto:placeholder@example.com` for local verification (both
+   clearly fake, per the brief's flag against fabricating anything
+   real-looking). Needs a real contact address before any real deploy.
+2. **Cloudflare Workers vs. Pages** (carried over from the prior session's
+   already-approved plan in `handoff/ARCHITECT-BRIEF.md`'s Builder Plan
+   section — restating here since it materially affects deploy mechanics):
+   `@opennextjs/cloudflare` deploys to Cloudflare **Workers**, not classic
+   Cloudflare **Pages**, which is what the original brief text says. This was
+   already flagged and reasoned through by the prior session (OpenNext is the
+   actively maintained, non-deprecated path for an App Router app with server
+   actions; `@cloudflare/next-on-pages` is legacy and Edge-runtime-only).
+   Restating for an explicit nod before an actual `wrangler deploy` ever
+   happens — no deploy has been attempted either way.
+3. **`@opennextjs/cloudflare` pinned to `1.15.1`, not latest** (new finding
+   this session, not anticipated by the prior session's plan): the latest
+   published version (`1.20.4` at the time of this session) requires Next.js
+   `>=15.5.24` and has fully dropped Next 14 support — confirmed via `npm view`
+   across the version history. `1.15.1` is the last version whose peer range
+   includes our pinned Next `14.2.35`. This is a real constraint, not a
+   preference: upgrading past `1.15.x` requires first upgrading Next 14 -> 15
+   across the whole `apps/web` app (Next 15 makes `cookies()`/`headers()`
+   async), a separate, unplanned decision this session did not make. Flagging
+   so it isn't silently "fixed" later by bumping the Cloudflare adapter without
+   realizing it drags Next 15 in with it.
+4. **One browser-internal step stubbed during live Web Push verification** —
+   the actual FCM/GCM push-service handshake inside `pushManager.subscribe()`
+   would not complete in this session's sandboxed execution environment under
+   any configuration tried (ephemeral context: blocked outright by Chrome's
+   deliberate incognito restriction on the Push API; persistent profile,
+   headless or headed: "push service not available", i.e. no reachable path to
+   Google's push infrastructure from this sandbox). Everything else in the flow
+   — real signup, real service worker registration, real permission-request
+   call, the real server action, and real RLS-scoped persistence to the live
+   `devices` table — was verified with that one call's return value stubbed to
+   a realistic-shaped fake `PushSubscription`. Recommend a real end-user
+   browser test (or a CI runner with genuine internet egress reaching Google's
+   push infrastructure) before fully trusting live push *delivery*; the
+   *subscribe-and-persist* path is fully verified as-is. Full narrative in
+   `handoff/BUILD-LOG.md`.
+5. **`supabase functions serve` doesn't work reliably on Windows + Docker
+   Desktop** for this function's import shape (see BUILD-LOG for the full
+   diagnosis) — worked around via direct `deno run` for this session's
+   verification, which exercises the identical source and import map. Not a
+   code defect; flagging in case Arch/owner wants to retest with a different
+   host or a newer Supabase CLI release before relying on `functions serve`
+   for future iteration.
+6. **Leftover test data in the real cloud Supabase project**: a handful of
+   `push-verify-*@example.com` test users (one `devices` row each) from the
+   live browser verification. Harmless, not cleaned up (no service-role key
+   available to this session for that project) — owner/Arch can delete via
+   the dashboard if desired.
 
 ## Known Gaps Logged
+See `handoff/BUILD-LOG.md` KG-5 through KG-7 (new this session) and the
+pre-existing KG-2/KG-3/KG-4 from Step 1 (unchanged).
 
-See `handoff/BUILD-LOG.md` "Known Gaps" for the full list (KG-1 through KG-4). Summary:
-- **KG-1** — Live-credential verification (dev boot, manual CRUD walkthrough, two-user RLS check, live Playwright run) blocked on the owner creating the Supabase project.
-- **KG-2** — No Supabase-generated `Database` type yet (needs a live project).
-- **KG-3** — `PROJECT_SPEC.txt` is a reconstruction, not a verified original (see Open Question 1).
-- **KG-4** — Cosmetic `turbo run build` warning about missing outputs for `tsc --noEmit`-only packages; build still exits 0.
+**Ready for Review: YES**

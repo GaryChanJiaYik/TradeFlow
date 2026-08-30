@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Deploy-readiness config only — see handoff/BUILD-LOG.md and
+  // handoff/REVIEW-REQUEST.md's open questions. No `wrangler deploy` has
+  // been run; the owner's Cloudflare account is not yet confirmed. This
+  // targets Cloudflare Workers (via the OpenNext adapter), not classic
+  // Cloudflare Pages — flagged for Arch/owner sign-off, see brief Step 2.
+  "main": ".open-next/worker.js",
+  "name": "tradeflow-web",
+  "compatibility_date": "2025-04-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "services": [
+    {
+      "binding": "WORKER_SELF_REFERENCE",
+      "service": "tradeflow-web"
+    }
+  ]
+}

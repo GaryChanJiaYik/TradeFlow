@@ -1,0 +1,5 @@
+# Wrangler-specific local dev vars for `opennextjs-cloudflare preview`
+# (separate mechanism from .env.local, which Next.js itself reads). Copy to
+# `.dev.vars` (gitignored) if you run the Cloudflare preview/deploy scripts
+# locally. Not needed for the normal `pnpm dev` flow.
+NEXTJS_ENV=development

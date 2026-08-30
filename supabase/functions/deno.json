@@ -1,0 +1,6 @@
+{
+  "unstable": ["sloppy-imports"],
+  "imports": {
+    "@tradeflow/types": "../../packages/types/src/index.ts"
+  }
+}

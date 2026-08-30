@@ -4,6 +4,7 @@ import type { PriceAlert } from "@tradeflow/types";
 import { createClient } from "@/lib/supabase/server";
 import { logOutAction } from "@/app/auth/actions";
 import { setAlertEnabledAction, deleteAlertAction } from "./actions";
+import { NotificationsControl } from "./notifications-control";
 
 type AlertRow = PriceAlert & { instruments: { symbol: string; name: string } | null };
 
@@ -25,6 +26,7 @@ export default async function DashboardPage() {
   const { data: alerts, error } = await supabase
     .from("price_alerts")
     .select("*, instruments(symbol, name)")
+    .eq("user_id", user.id)
     .order("created_at", { ascending: false })
     .returns<AlertRow[]>();
 
@@ -46,6 +48,8 @@ export default async function DashboardPage() {
           </form>
         </div>
       </div>
+
+      <NotificationsControl />
 
       <div className="card">
         {error && <div className="form-error">Could not load alerts.</div>}
