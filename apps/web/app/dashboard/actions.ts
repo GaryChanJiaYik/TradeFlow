@@ -40,7 +40,10 @@ function readAlertFormFields(formData: FormData) {
     trigger_mode: formData.get("trigger_mode"),
     expiration_at:
       typeof expirationRaw === "string" && expirationRaw.trim() !== ""
-        ? new Date(expirationRaw).toISOString()
+        ? (() => {
+            const parsed = new Date(expirationRaw);
+            return Number.isNaN(parsed.getTime()) ? expirationRaw : parsed.toISOString();
+          })()
         : null,
     message: typeof messageRaw === "string" && messageRaw.trim() !== "" ? messageRaw : null,
     enabled: formData.get("enabled") === "on",

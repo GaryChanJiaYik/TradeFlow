@@ -5,6 +5,21 @@ Ready for Review: YES
 
 ---
 
+## Round 2 — Review Feedback Addressed (2026-08-30)
+
+Both findings from `handoff/REVIEW-FEEDBACK.md` (2026-08-30, first pass) are fixed:
+
+- **Must Fix** — `apps/web/app/dashboard/alerts/[id]/edit/page.tsx:16-20` — added `.eq("user_id", user.id)` to the `price_alerts` select alongside `.eq("id", params.id)`, matching the app-side scoping pattern used by every other `price_alerts` query in `apps/web/app/dashboard/actions.ts`. Closes the gap where this one read relied on RLS alone.
+- **Should Fix** — `apps/web/app/dashboard/actions.ts:34-51` (`readAlertFormFields`) — now checks `Number.isNaN(parsed.getTime())` before calling `.toISOString()` on the parsed expiration date; an unparseable string is passed through raw so the zod schema's `expirationMustBeFuture` refine rejects it with a friendly validation error instead of the action throwing an uncaught `RangeError`.
+
+No other files touched — scope-locked to these two fixes per Richard's feedback.
+
+Verification (repo root, after fix): `pnpm build`, `pnpm test`, `pnpm typecheck` all pass. See `handoff/BUILD-LOG.md` "Review Fixes" entry for details.
+
+**Ready for Review: YES**
+
+---
+
 ## What Was Built
 
 A Turborepo + pnpm monorepo for TradeFlow: four TypeScript packages

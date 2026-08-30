@@ -26,8 +26,22 @@ Decisions made:
 - Server actions (not client-side fetch + API routes) used for all alert CRUD and auth flows, using React 18's `useFormState`/`useFormStatus` from `react-dom` — standard Next.js 14 App Router pattern, keeps the UI functional without additional client-side data-fetching libraries.
 - No Database-generated TypeScript types from Supabase CLI (`supabase gen types typescript`) — that requires a live project to introspect, which does not exist yet. Query results are typed manually via `.returns<T>()` casts against `@tradeflow/types` interfaces instead. Should be replaced with generated types once the project exists (Step 2 or later).
 
-Reviewer findings: not yet reviewed.
+Architect notes (2026-08-30): Reviewed Bob's open questions from REVIEW-REQUEST.md.
+- Open Question 1 (PROJECT_SPEC.txt provenance) — RESOLVED. Replaced the reconstructed
+  file with the owner's actual verbatim spec text (had it from the planning conversation).
+  KG-3 is closed.
+- Open Questions 2-5 (handle_new_user trigger, no generated Database type yet,
+  extensionless workspace-package imports, unpinned-by-brief dependency versions) —
+  APPROVED as built. All are sound, low-risk technical calls within normal Builder
+  discretion; no changes requested.
+
+Reviewer findings (2026-08-30, Richard's first pass): 1 Must Fix, 1 Should Fix — both addressed same day, see "Review Fixes" below.
 Deploy: N/A — not deployed anywhere yet.
+
+**Review Fixes (2026-08-30):**
+- **Must Fix** — `apps/web/app/dashboard/alerts/[id]/edit/page.tsx` fetched the alert-to-edit by `.eq("id", params.id)` only, relying on RLS alone to stop cross-user access. Added `.eq("user_id", user.id)` to the select, matching the app-side defense-in-depth pattern already used by every other `price_alerts` query in `apps/web/app/dashboard/actions.ts`.
+- **Should Fix** — `apps/web/app/dashboard/actions.ts` (`readAlertFormFields`) called `new Date(expirationRaw).toISOString()` before zod validation ran, so an unparseable date string threw an uncaught `RangeError` (raw 500) instead of a friendly validation error. Now checks `Number.isNaN(parsed.getTime())` first (same check `expirationMustBeFuture`'s refine already does); if invalid, the raw string is passed through so `updatePriceAlertSchema`/`createPriceAlertSchema`'s refine rejects it cleanly.
+- Verified after fix: `pnpm build`, `pnpm test` (8/8 alert-engine tests pass), `pnpm typecheck` — all green, repo root.
 
 **What was verified locally (no live Supabase project required):**
 - `pnpm install` — succeeds, 6 workspace packages linked.

@@ -17,6 +17,7 @@ export default async function EditAlertPage({ params }: { params: { id: string }
     .from("price_alerts")
     .select("*")
     .eq("id", params.id)
+    .eq("user_id", user.id)
     .maybeSingle<PriceAlert>();
 
   if (!alert) {

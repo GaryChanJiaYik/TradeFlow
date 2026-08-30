@@ -1,170 +1,1409 @@
-TRADEFLOW — PROJECT SPEC
-=========================
+Personal XAUUSD Trading Alert & Reminder Application
 
-NOTE ON THIS DOCUMENT
----------------------
-This file was reconstructed by Bob (Builder) from the decisions, constraints,
-and wording captured in handoff/ARCHITECT-BRIEF.md (Step 1), because the
-original verbatim project spec was not available in this build session. It
-is believed to faithfully cover everything the brief itself relies on, but
-it is NOT a verified copy of the owner's original spec document. If a
-verbatim original exists, it should replace this file — see the open
-question logged in handoff/REVIEW-REQUEST.md.
+Arch and me is the owner of this project. Bob is the primary AI software engineer working with us on this project.
 
-1. PRODUCT OVERVIEW
---------------------
-TradeFlow is a price-alert and trading-reminder platform. A user creates
-alerts against a tradable instrument's price (V1: gold, symbol XAUUSD) and
-gets notified when the price crosses a target threshold. A related feature,
-graph reminders, lets a user schedule a reminder to review a given
-instrument's chart on a timeframe, at a recurring time in their own
-timezone. Notifications are intended to be delivered via Web Push to
-registered devices.
+Arch, Richard and Bob job is to help me design, build, test, document, and improve a personal trading alert application.
 
-2. TECH STACK
--------------
-- Monorepo: Turborepo + pnpm workspaces.
-- Frontend: Next.js (App Router), TypeScript in strict mode.
-- Auth/session/database: Supabase (Postgres + Auth), accessed via
-  @supabase/ssr (not the older auth-helpers-nextjs package).
-- Validation: zod schemas that mirror the database's constraints exactly, so
-  invalid input is rejected before it ever reaches the database.
-- Local development targets a real Supabase free-tier cloud project directly
-  — no local Docker `supabase start` stack.
+Read this entire instruction before doing anything.
 
-3. DATA MODEL
--------------
-profiles
-  - id (references auth.users, primary key)
-  - email
-  - timezone
-  - created_at, updated_at
-  Supabase's auth.users table is the sole source of truth for identity and
-  credentials. The app never creates its own users table.
+============================================================
 
-instruments
-  - id, symbol, name, asset_type, enabled
-  - last_price, last_price_at — the most recently observed tick for this
-    instrument. This is where the "previous price" used in alert-crossing
-    comparisons lives; there is no separate price-ticks/history table in V1.
-  - created_at
-  V1 ships with exactly one seeded row: XAUUSD / Gold / metal / enabled.
+PROJECT VISION
+============================================================
 
-price_alerts
-  - id, user_id, instrument_id
-  - target_price (must be > 0, no upper bound)
-  - direction: CROSS_UP | CROSS_DOWN | CROSS_BOTH
-  - trigger_mode: ONCE | EVERY_TIME
-  - expiration_at (nullable; if set, must be in the future at creation time)
-  - message (optional free text shown in the notification)
-  - enabled
-  - last_triggered_at (nullable; last time this alert fired)
-  - created_at, updated_at
-  No uniqueness constraint — a user may create duplicate/overlapping alerts.
+I want to build a personal trading-related application that I can
+eventually access from:
 
-graph_reminders
-  - id, user_id, instrument_id
-  - timeframe: 15m | 1H | 4H | 1D
-  - description (optional)
-  - timezone (IANA name, e.g. "Asia/Kuala_Lumpur")
-  - enabled
-  - next_trigger_at
-  - created_at, updated_at
+Web
+Windows
+macOS
+Android
+iOS
 
-devices
-  - id, user_id, platform (web | ios | android)
-  - subscription (JSONB) — holds a Web Push PushSubscription object
-    (endpoint + keys), not an FCM/Expo push token
-  - enabled, last_seen_at
-  - created_at, updated_at
+However, DO NOT build all platforms immediately.
 
-notification_log
-  - id, user_id, device_id
-  - event_type: PRICE_ALERT | GRAPH_REMINDER
-  - title, message
-  - status: SENT | FAILED | PENDING
-  - sent_at, created_at
+The immediate goal is to build a simple, reliable V1 focused ONLY
+on XAUUSD.
 
-4. ROW LEVEL SECURITY
-----------------------
-Every user-owned table (profiles, price_alerts, graph_reminders, devices,
-notification_log) is restricted so a row is only visible/writable when
-auth.uid() equals that row's owner column (user_id, or id for profiles).
-instruments is readable by any authenticated user, but only writable by the
-service role (the service role is not used until Step 2, when the price
-feed starts writing last_price/last_price_at).
+The application will eventually grow to support additional assets
+such as:
 
-5. ALERT ENGINE SEMANTICS
---------------------------
-The alert engine is a pure, I/O-free function:
+EURUSD
+GBPUSD
+USDJPY
+BTCUSD / BTCUSDT
+ETHUSD / ETHUSDT
+Other forex pairs
+Other metals
+Crypto
+Indices
+Other assets
 
-    evaluatePriceAlert(alert, previousPrice, currentPrice, now) -> boolean
+But these are FUTURE features.
 
-Rules:
-  - CROSS_UP triggers when previousPrice < target AND currentPrice >= target.
-  - CROSS_DOWN triggers when previousPrice > target AND currentPrice <= target.
-  - CROSS_BOTH triggers on either of the above.
-  - A bare "currentPrice >= target" with no actual crossing (e.g. the price
-    was already above target on the previous tick) must NEVER trigger.
-  - ONCE mode fires on the first valid crossing only. The engine itself is
-    stateless — it does not mutate anything — so "don't fire again" is
-    expressed purely through the caller passing in the alert's current
-    last_triggered_at / enabled state as an input on each call.
-  - EVERY_TIME mode may fire again on a later, genuinely new crossing, but
-    must not fire again merely because price remains past the threshold
-    without re-crossing it.
-  - An alert whose expiration_at is in the past (relative to `now`) never
-    triggers.
-  - A disabled alert never triggers.
+DO NOT implement them in V1.
 
-Required test coverage (exactly these 8 cases):
-  1. CROSS_UP triggers: prev 3399 -> cur 3401, target 3400
-  2. CROSS_UP does NOT trigger without crossing: prev 3401 -> cur 3402, target 3400
-  3. CROSS_DOWN triggers: prev 3401 -> cur 3399, target 3400
-  4. CROSS_DOWN does NOT trigger without crossing: prev 3399 -> cur 3398, target 3400
-  5. ONCE: fires on first crossing, not on second
-  6. EVERY_TIME: fires on first AND a second independent crossing
-  7. Expired alert: never triggers
-  8. Disabled alert: never triggers
+The architecture should allow future expansion without requiring a
+complete rewrite.
 
-6. MARKET DATA
---------------
-A `MarketDataProvider` interface abstracts the price feed:
+============================================================
+2. CURRENT PRODUCT
 
-    interface MarketDataProvider {
-      getPrice(instrument: string): Promise<PriceUpdate>;
-    }
+Product name:
 
-    interface PriceUpdate {
-      instrument: string;
-      price: number;
-      timestamp: string;
-      provider: string;
-    }
+TradeFlow
 
-V1's only concrete implementation is OANDA, but it requires the owner to
-have created an OANDA account and is out of scope until Step 2. The V1
-interface is defined with no concrete implementation and no placeholder
-stub file for it.
+Current users:
 
-7. ALERT MANAGEMENT UI
-------------------------
-A signed-in user can Create, View, Edit, Enable/Disable, and Delete price
-alerts against the single seeded instrument (XAUUSD) — the UI does not
-offer an instrument picker in V1, and editing an alert never changes which
-instrument it targets. Delete-and-recreate is explicitly not an acceptable
-substitute for Edit.
+ONE USER
 
-8. OUT OF SCOPE FOR STEP 1
----------------------------
-- Any concrete MarketDataProvider implementation (OANDA or otherwise).
-- Scheduled/cron-driven evaluation of alerts or reminders (pg_cron or any
-  equivalent).
-- Web Push subscription flow, VAPID key setup, and any push-notification UI.
-- Graph reminders UI (the table exists in the schema; no screens yet).
+Current primary asset:
 
-9. COST / FREE TIER
---------------------
-See README.md's "COST / FREE TIER" section for the current (Step 1)
-breakdown. OANDA and hosting costs will be documented there once they are
-introduced in Step 2.
+XAUUSD
+
+Current goal:
+
+Build the smallest useful version of the application and get it
+running reliably before adding more features.
+
+============================================================
+3. MOST IMPORTANT REQUIREMENT — $0 COST
+
+The project has a strong target:
+
+TARGET COST = $0/month
+
+I want to build and operate this application without paying for
+servers, databases, APIs, or other infrastructure if reasonably
+possible.
+
+Always consider free/open-source alternatives first.
+
+Before introducing a paid service:
+
+Determine whether a free alternative exists.
+Determine whether the free alternative is technically suitable.
+Explain the limitations.
+Explain the potential cost if we eventually exceed the free tier.
+Ask for approval before introducing recurring costs.
+
+NEVER assume that "free trial" means "free forever".
+
+Distinguish between:
+
+Free forever
+Free tier with limits
+Free trial
+Credit-based free usage
+Temporarily free
+
+The goal is genuine $0/month operation where technically feasible.
+
+============================================================
+4. IMPORTANT — COMPUTER MUST NOT NEED TO STAY ON
+
+My Windows laptop is the DEVELOPMENT machine.
+
+It must NOT be required to remain powered on for the production
+application.
+
+Production should work like this:
+
+My computer:
+OFF
+
+My browser:
+CLOSED
+
+My mobile application:
+CLOSED
+
+Cloud monitoring:
+STILL RUNNING
+
+XAUUSD price crosses alert:
+↓
+Cloud detects event
+↓
+Push notification
+↓
+My phone receives notification
+
+This is a core requirement.
+
+============================================================
+5. LOW COMPUTATION / LOW RESOURCE REQUIREMENT
+
+The application should consume as little computing power as
+possible.
+
+The current user count is ONE.
+
+Do not design for thousands or millions of users.
+
+Do not over-engineer.
+
+Do NOT introduce unnecessary:
+
+Kubernetes
+Kafka
+Redis
+RabbitMQ
+Microservice clusters
+Multiple servers
+GPU
+Large databases
+Complex event buses
+Distributed systems
+
+unless a genuine technical requirement appears later.
+
+A tiny always-on worker is preferred.
+
+============================================================
+6. CORE ARCHITECTURE
+
+The preferred architecture is:
+
+                USER
+                  |
+      +-----------+-----------+
+      |                       |
+    WEB                    MOBILE
+      |                       |
+      +-----------+-----------+
+                  |
+                  v
+              SUPABASE
+                  |
+      +-----------+-----------+
+      |                       |
+  DATABASE                  AUTH
+      |
+      v
+
+
+SMALL CLOUD WORKER
+|
+v
+XAUUSD DATA
+|
+v
+ALERT ENGINE
+|
+v
+PUSH NOTIFICATION
+|
+v
+PHONE
+
+The cloud worker is responsible for continuous XAUUSD monitoring.
+
+The client applications must NOT continuously poll the market.
+
+============================================================
+7. MARKET DATA ARCHITECTURE
+
+Do NOT hard-code the alert engine directly to one API.
+
+Use a small abstraction around market data.
+
+Conceptually:
+
+MarketDataProvider
+|
+v
+PriceUpdate
+|
+v
+AlertEngine
+
+A PriceUpdate should conceptually contain:
+
+instrument
+price
+timestamp
+provider
+
+For V1 there is only:
+
+instrument = XAUUSD
+
+Do NOT implement BTC, EURUSD, etc. yet.
+
+However, do not design the alert engine in a way that makes adding
+another instrument impossible.
+
+Future architecture may eventually become:
+
+MarketDataProvider
+|
++-- MT5Provider
++-- BinanceProvider
++-- OtherProvider
+
+But ONLY implement what is necessary for XAUUSD V1.
+
+============================================================
+8. XAUUSD DATA SOURCE
+
+The XAUUSD data source must be investigated before finalizing the
+production architecture.
+
+Important considerations:
+
+Is the data genuinely real-time?
+Is it legally/technically usable?
+Is it free?
+Does the free tier allow continuous monitoring?
+Does it support streaming/WebSocket?
+What are the rate limits?
+Does the price correspond closely to the user's actual trading
+environment?
+Does it require a paid subscription after a trial?
+Can it run continuously on our free cloud worker?
+
+Do not select a provider simply because its website says "free".
+
+Document the exact limitations.
+
+If MT5 is the best source for XAUUSD, investigate how we can
+reliably monitor it 24/7 without my personal computer running.
+
+============================================================
+9. MT5 FUTURE INTEGRATION
+
+MT5 support is important to the long-term project.
+
+Eventually I want:
+
+Connect MT5 account
+Support multiple MT5 accounts
+Detect trade opened
+Detect trade closed
+Send push notification
+
+However:
+
+DO NOT implement full MT5 account integration in the first
+vertical slice unless required for the initial XAUUSD price feed.
+
+The architecture should allow an MT5 integration later.
+
+Potential future architecture:
+
+MT5 Terminal
+|
+MQL5 Expert Advisor
+|
+HTTPS/API
+|
+Backend
+|
+Notification
+
+The production MT5 environment must eventually be capable of
+running without my personal Windows laptop.
+
+DO NOT assume an arbitrary server can run MT5.
+
+Investigate compatibility before making infrastructure decisions.
+
+============================================================
+10. V1 FEATURES
+
+V1 should contain ONLY these major features:
+
+FEATURE A:
+XAUUSD Price Alerts
+
+FEATURE B:
+XAUUSD Chart Reminders
+
+FEATURE C:
+Push Notifications
+
+FEATURE D:
+Basic Authentication
+
+FEATURE E:
+Basic Alert/Reminder management
+
+============================================================
+11. FEATURE A — PRICE ALERTS
+
+A user can create an XAUUSD price alert.
+
+Example:
+
+Asset:
+XAUUSD
+
+Target:
+3400.00
+
+Direction:
+CROSS_UP
+
+Trigger:
+ONCE
+
+Expiration:
+Optional
+
+Message:
+Check the chart
+
+Supported directions:
+
+CROSS_UP
+CROSS_DOWN
+CROSS_BOTH
+
+Supported trigger modes:
+
+ONCE
+EVERY_TIME
+
+Optional expiration date/time.
+
+Optional custom message.
+
+User must be able to:
+
+Create
+View
+Edit
+Enable
+Disable
+Delete
+============================================================
+12. PRICE CROSSING LOGIC
+
+This is extremely important.
+
+Do NOT implement:
+
+current_price >= target
+
+as the sole condition for CROSS_UP.
+
+A crossing must actually occur.
+
+CROSS_UP:
+
+previous_price < target
+AND
+current_price >= target
+
+CROSS_DOWN:
+
+previous_price > target
+AND
+current_price <= target
+
+CROSS_BOTH:
+
+A valid upward OR downward crossing.
+
+The system should not repeatedly trigger while the price remains
+on the same side of the threshold.
+
+============================================================
+13. ONCE ALERT
+
+If an alert is:
+
+ONCE
+
+Then:
+
+First valid crossing:
+Trigger
+
+After successful trigger:
+Mark consumed/triggered
+Do not trigger again
+
+============================================================
+14. EVERY_TIME ALERT
+
+If an alert is:
+
+EVERY_TIME
+
+Then each valid crossing may trigger.
+
+However, do not send repeated notifications merely because the
+price continues moving above or below the target.
+
+The price must cross the threshold again.
+
+============================================================
+15. EXPIRATION
+
+Alerts may have an expiration date/time.
+
+After expiration:
+
+Do not trigger
+Mark inactive/expired where appropriate
+
+Expiration must be enforced server-side.
+
+Do not rely exclusively on the client.
+
+============================================================
+16. FEATURE B — GRAPH REMINDERS
+
+Users can create reminders to check the XAUUSD chart.
+
+Example:
+
+Asset:
+XAUUSD
+
+Timeframe:
+15m
+
+Description:
+Check for breakout
+
+Another example:
+
+Asset:
+XAUUSD
+
+Timeframe:
+4H
+
+Description:
+Review market structure
+
+Initial supported timeframes:
+
+15m
+1H
+4H
+1D
+
+The architecture should allow additional timeframes later.
+
+The reminder should work even if the application is closed.
+
+The server/cloud worker should determine when the reminder is due.
+
+The mobile device should NOT continuously run a timer in the
+background.
+
+============================================================
+17. FEATURE C — PUSH NOTIFICATIONS
+
+The system should send push notifications for:
+
+Price alert triggered
+Graph reminder due
+
+Notification should contain useful information.
+
+Example:
+
+XAUUSD Price Alert
+
+XAUUSD crossed 3400.00 upward.
+
+Message:
+Check the chart.
+
+Push notification should be generated by the cloud side.
+
+Do not depend on the application being open.
+
+============================================================
+18. BATTERY REQUIREMENT
+
+Mobile battery consumption must be minimal.
+
+Avoid:
+
+Continuous polling
+Background market monitoring
+Constant WebSocket connections from mobile
+High-frequency timers
+
+Preferred:
+
+Cloud monitoring
+↓
+Event
+↓
+Push notification
+↓
+Phone wakes for notification
+
+============================================================
+19. AUTHENTICATION
+
+Use Supabase Auth unless a strong technical reason requires
+otherwise.
+
+V1 only needs:
+
+Register
+Login
+Logout
+Session management
+
+Do not implement social login unless needed.
+
+============================================================
+20. DATABASE
+
+Preferred database:
+
+PostgreSQL through Supabase.
+
+Initial conceptual tables:
+
+USERS
+
+id
+email
+timezone
+created_at
+updated_at
+
+INSTRUMENTS
+
+id
+symbol
+name
+asset_type
+enabled
+created_at
+
+V1 contains only:
+
+XAUUSD
+
+PRICE_ALERTS
+
+id
+user_id
+instrument_id
+target_price
+direction
+trigger_mode
+expiration_at
+message
+enabled
+last_triggered_at
+created_at
+updated_at
+
+GRAPH_REMINDERS
+
+id
+user_id
+instrument_id
+timeframe
+description
+timezone
+enabled
+next_trigger_at
+created_at
+updated_at
+
+DEVICES
+
+id
+user_id
+platform
+push_token
+enabled
+last_seen_at
+created_at
+updated_at
+
+NOTIFICATION_LOG
+
+id
+user_id
+device_id
+event_type
+title
+message
+status
+sent_at
+created_at
+
+The exact database design may be improved if there is a strong
+technical reason.
+
+============================================================
+21. SECURITY
+
+Security is important even though this is a personal application.
+
+Never:
+
+Commit secrets to Git
+Commit API keys
+Commit database service-role keys
+Store passwords in plaintext
+Put secret keys in frontend code
+Put MT5 credentials into frontend code
+
+Use environment variables/secrets.
+
+Use PostgreSQL Row Level Security where appropriate.
+
+A user must only be able to access their own:
+
+Alerts
+Reminders
+Devices
+Notification history
+Future MT5 accounts
+Future trades
+============================================================
+22. TECHNOLOGY STACK
+
+Preferred stack:
+
+LANGUAGE:
+TypeScript
+
+WEB:
+Next.js
+React
+TypeScript
+
+MOBILE:
+React Native
+Expo
+TypeScript
+
+DESKTOP:
+Tauri
+React
+
+BACKEND:
+Supabase
+
+DATABASE:
+PostgreSQL
+
+AUTH:
+Supabase Auth
+
+SERVER FUNCTIONS:
+Supabase Edge Functions where appropriate
+
+CLOUD WORKER:
+Python or TypeScript
+
+Choose Python if it provides a simpler/reliable implementation
+for the market-data worker.
+
+WEB HOSTING:
+Prefer Cloudflare or another genuine free-tier service.
+
+PACKAGE MANAGER:
+pnpm
+
+MONOREPO:
+Turborepo
+
+TESTING:
+Vitest
+Playwright
+
+VERSION CONTROL:
+Git
+GitHub
+
+============================================================
+23. IMPORTANT — DO NOT OVER-IMPLEMENT
+
+The current project is for ONE USER.
+
+Do not optimize for:
+
+High traffic
+Thousands of simultaneous connections
+Multi-region deployment
+Horizontal scaling
+Enterprise security architecture
+Complex observability platforms
+
+We care about:
+
+Correctness
+Reliability
+Low cost
+Low resource consumption
+Simple maintenance
+Security
+Future extensibility
+
+Minor optimization is acceptable but major optimization such as controlling high traffic, simultaneous connection etc. are not the current goal for v1.
+============================================================
+24. FUTURE EXTENSIBILITY
+
+The application will eventually support more assets.
+
+Potential future assets:
+
+Forex:
+
+EURUSD
+GBPUSD
+USDJPY
+
+Crypto:
+
+BTCUSD
+BTCUSDT
+ETHUSD
+ETHUSDT
+
+Metals:
+
+XAGUSD
+
+Indices:
+
+NAS100
+US30
+SPX500
+
+DO NOT implement these now.
+
+But ensure the internal architecture uses concepts such as:
+
+Instrument
+MarketDataProvider
+PriceUpdate
+AlertEngine
+
+rather than hard-coding XAUUSD everywhere.
+
+============================================================
+25. FUTURE DATA PROVIDERS
+
+Potential future providers:
+
+MT5
+Binance
+OANDA
+Other legitimate providers
+
+DO NOT integrate all providers now.
+
+Only create a clean abstraction so they can be added later.
+
+============================================================
+26. FUTURE MT5 FEATURES
+
+Eventually:
+
+MT5 ACCOUNT
+|
++-- Account A
++-- Account B
++-- Account C
+
+Events:
+
+Trade opened
+Trade closed
+Position modified
+Stop loss
+Take profit
+Pending order
+Partial close
+
+These are future features.
+
+Do not implement automated trading.
+
+============================================================
+27. NON-GOALS
+
+Do NOT implement:
+
+Automated trading
+Buy/sell execution
+Copy trading
+Trading signals
+AI trading strategy
+Social trading
+Paid subscriptions
+Payments
+Trading marketplace
+Complex portfolio analytics
+Social network
+Trading journal
+
+unless explicitly requested later.
+
+============================================================
+28. DEVELOPMENT PRINCIPLE
+
+BUILD VERTICAL SLICES.
+
+Do not create the entire architecture first and then spend weeks
+building disconnected components.
+
+Example:
+
+SLICE 1:
+
+Login
+↓
+Create XAUUSD alert
+↓
+Store alert
+↓
+Receive XAUUSD price
+↓
+Detect crossing
+↓
+Send push notification
+↓
+Record event
+
+Only after this works should we expand.
+
+============================================================
+29. FIRST MILESTONE
+
+The first milestone is NOT the complete application.
+
+The first milestone is:
+
+"Can I create an XAUUSD price alert and receive a notification
+when the cloud detects the price crossing my target while my
+Windows laptop is completely OFF?"
+
+If YES:
+
+The architecture is proven.
+
+If NO:
+
+Do not continue building more UI/features.
+
+Fix the infrastructure/data/notification architecture first.
+
+============================================================
+30. DEVELOPMENT ENVIRONMENT
+
+Development OS:
+
+Windows
+
+Expected manually installed tools:
+
+Git
+Node.js LTS
+pnpm
+Visual Studio Code
+Python
+Rust
+Docker Desktop
+MetaTrader 5
+MetaEditor
+
+Only install tools that are genuinely required.
+
+Do not globally install unnecessary npm packages.
+
+============================================================
+31. PROJECT STRUCTURE
+
+A possible structure:
+
+trading-alert-app/
+
+apps/
+    web/
+    mobile/
+    desktop/
+
+packages/
+    types/
+    validation/
+    ui/
+
+worker/
+    market/
+    alerts/
+    notifications/
+
+supabase/
+    migrations/
+    functions/
+
+mt5/
+    future/
+
+docs/
+
+PROJECT_SPEC.txt
+AGENTS.md
+README.md
+
+
+The exact structure can change if the implementation has a strong
+reason to use another organization.
+
+============================================================
+32. AI AGENT BEHAVIOR
+
+Before modifying anything:
+
+Inspect the repository.
+Read PROJECT_SPEC.txt.
+Read AGENTS.md if present.
+Inspect package files.
+Inspect environment configuration.
+Determine what already exists.
+Do not assume a blank project unless verified.
+
+Before major architectural decisions:
+
+Explain:
+
+What you want to change
+Why
+Cost
+Advantages
+Disadvantages
+Alternatives
+
+Do not silently introduce paid services.
+
+============================================================
+33. AI AGENT SHOULD NOT ASK UNNECESSARY QUESTIONS
+
+If a decision is low-risk and reversible:
+
+Make a reasonable decision and proceed.
+
+If a decision affects:
+
+Cost
+Production infrastructure
+Security
+Database architecture
+Market-data provider
+MT5 architecture
+Recurring billing
+
+Stop and explain the decision before proceeding.
+
+============================================================
+34. TESTING REQUIREMENTS
+
+The alert engine must have automated tests.
+
+At minimum:
+
+CROSS_UP:
+
+Previous:
+3399
+
+Current:
+3401
+
+Target:
+3400
+
+Expected:
+TRIGGER
+
+CROSS_UP without crossing:
+
+Previous:
+3401
+
+Current:
+3402
+
+Target:
+3400
+
+Expected:
+NO TRIGGER
+
+CROSS_DOWN:
+
+Previous:
+3401
+
+Current:
+3399
+
+Target:
+3400
+
+Expected:
+TRIGGER
+
+CROSS_DOWN without crossing:
+
+Previous:
+3399
+
+Current:
+3398
+
+Target:
+3400
+
+Expected:
+NO TRIGGER
+
+ONCE:
+
+First crossing:
+TRIGGER
+
+Second crossing:
+NO TRIGGER
+
+EVERY_TIME:
+
+First crossing:
+TRIGGER
+
+Second independent crossing:
+TRIGGER
+
+EXPIRATION:
+
+After expiration:
+NO TRIGGER
+
+DISABLED:
+
+Disabled alert:
+NO TRIGGER
+
+============================================================
+35. RELIABILITY
+
+The system must consider:
+
+Duplicate price events
+Network failures
+Market-data disconnection
+Notification failures
+Database failures
+Expired alerts
+Disabled alerts
+Deleted alerts
+
+Where practical, event handling should be idempotent.
+
+Do not accidentally send multiple notifications for the same event.
+
+============================================================
+36. LOGGING
+
+Useful events should be logged:
+
+Worker started
+Market connection established
+Market connection lost
+Price received
+Alert triggered
+Notification sent
+Notification failed
+Reminder triggered
+
+NEVER log:
+
+Passwords
+API keys
+Access tokens
+MT5 credentials
+Database secrets
+============================================================
+37. COST MONITORING
+
+Every external service must be documented with:
+
+Service:
+Purpose:
+Free tier:
+Usage limit:
+What happens when limit is exceeded:
+Potential paid cost:
+Alternative:
+
+The README should contain a section:
+
+"COST / FREE TIER"
+
+This must be updated whenever infrastructure changes.
+
+============================================================
+38. DOCUMENTATION
+
+Maintain:
+
+README.md
+
+PROJECT_SPEC.txt
+
+AGENTS.md
+
+docs/
+
+Important documentation:
+
+Architecture
+Local development
+Environment variables
+Database
+Alert engine
+Market-data provider
+Deployment
+Notifications
+Troubleshooting
+Cost/free-tier information
+============================================================
+39. GIT REQUIREMENTS
+
+Use Git from the beginning.
+
+Make logical commits.
+
+Do not commit:
+
+.env
+.env.local
+credentials
+secrets
+build artifacts
+node_modules
+temporary files
+
+============================================================
+40. IMPLEMENTATION ORDER
+
+Follow this order unless there is a strong technical reason not to:
+
+PHASE 1
+Environment verification
+
+PHASE 2
+Repository initialization
+
+PHASE 3
+Monorepo setup
+
+PHASE 4
+Supabase setup
+
+PHASE 5
+Database schema
+
+PHASE 6
+Authentication
+
+PHASE 7
+Basic web UI
+
+PHASE 8
+XAUUSD instrument
+
+PHASE 9
+Price-alert database/API
+
+PHASE 10
+XAUUSD market-data provider
+
+PHASE 11
+Alert engine
+
+PHASE 12
+Push notifications
+
+PHASE 13
+End-to-end test
+
+PHASE 14
+Deploy cloud worker
+
+PHASE 15
+Test with Windows laptop OFF
+
+PHASE 16
+Graph reminders
+
+PHASE 17
+Polish/security/reliability
+
+Only after these work should we begin future features.
+
+============================================================
+41. DEFINITION OF DONE FOR V1
+
+V1 is considered successful when:
+
+I can:
+
+Open the web application.
+Register/login.
+Create an XAUUSD price alert.
+Select CROSS_UP/CROSS_DOWN/CROSS_BOTH.
+Select ONCE/EVERY_TIME.
+Set expiration.
+Add a message.
+Save the alert.
+Close the browser.
+Turn OFF my Windows laptop.
+Have the cloud worker continue monitoring XAUUSD.
+Have the price cross the target.
+Receive a push notification on my phone.
+See the alert event recorded.
+Create an XAUUSD chart reminder.
+Receive the reminder notification.
+
+This is the primary success criterion.
+
+============================================================
+42. FUTURE ROADMAP
+
+After V1 works:
+
+V2:
+
+Better notification settings
+Better reminder system
+Better UI
+Notification history
+
+V3:
+
+MT5 account connection
+MT5 trade opened notification
+MT5 trade closed notification
+
+V4:
+
+Multiple MT5 accounts
+
+V5:
+
+Additional assets
+EURUSD
+GBPUSD
+BTCUSD/BTCUSDT
+ETHUSD/ETHUSDT
+
+V6:
+
+Desktop application
+
+V7:
+
+Additional providers
+Advanced trading features
+
+This roadmap is flexible.
+
+============================================================
+43. MOST IMPORTANT RULES
+
+RULE 1:
+Keep V1 simple.
+
+RULE 2:
+XAUUSD only.
+
+RULE 3:
+ONE USER.
+
+RULE 4:
+Target $0/month.
+
+RULE 5:
+Cloud must continue working when my laptop is OFF.
+
+RULE 6:
+Do not continuously monitor prices from the phone.
+
+RULE 7:
+Use push notifications.
+
+RULE 8:
+Use streaming market data when practical instead of aggressive
+polling.
+
+RULE 9:
+Do not over-engineer.
+
+RULE 10:
+Do not introduce paid infrastructure without approval.
+
+RULE 11:
+Do not hard-code XAUUSD into the entire architecture.
+
+RULE 12:
+Design clean extension points for future instruments/providers.
+
+RULE 13:
+Do not implement future features prematurely.
+
+RULE 14:
+Automated trading is NOT part of this project.
+
+RULE 15:
+Correctness is more important than adding features quickly.
+
+============================================================
+44. FIRST TASK
+
+DO NOT START BY BUILDING THE APPLICATION.
+
+First:
+
+Inspect my Windows development environment.
+Identify which required tools are installed.
+Identify which tools are missing.
+Check their versions.
+Verify Git.
+Verify Node.js.
+Verify pnpm.
+Verify Python.
+Verify Rust.
+Verify Docker if needed.
+Check whether MetaTrader 5 is installed.
+Check whether VS Code is installed.
+
+Then provide me with a concise report:
+
+INSTALLED
+
+Tool
+Version
+Status
+
+MISSING
+
+Tool
+Recommended version
+Reason
+
+Then propose the next development step.
+
+Do not install software automatically unless I explicitly give you
+permission to do so.
+
+You are equipped with OMNI and Three Man Team, utilize them throughout this project.
