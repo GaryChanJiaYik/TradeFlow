@@ -5,9 +5,9 @@
 
 ## Current Status
 
-**Active step:** Step 1 — Repo scaffold, schema, auth, alert CRUD, alert-engine core
-**Last cleared:** none yet (first step)
-**Pending deploy:** N/A — no deploy target yet; blocked on Supabase project creation (see Known Gaps)
+**Active step:** Step 1 — CLEAR (code-complete; live-credential verification still pending Supabase project)
+**Last cleared:** Step 1 — 2026-08-30, Richard's round-2 re-review
+**Pending deploy:** N/A — no deploy target yet; nothing to push to production until Step 2 (OANDA + cron + push + hosting). Local git commits made: 766bc6c, eae9166.
 
 ---
 
