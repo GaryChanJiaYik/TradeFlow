@@ -5,9 +5,9 @@
 
 ## Current Status
 
-**Active step:** Step 2 — Richard's round-1 review findings fixed; resubmitted for final pass. Everything OANDA-credential-dependent and every owner/Arch-side dashboard/CLI action (real function deploy, pg_cron/pg_net enablement on the real project, an actual Cloudflare deploy) is explicitly blocked — see "Blocked / Not Attempted" below, not silently skipped.
-**Last cleared:** Step 1 — 2026-08-30, Richard's round-2 re-review
-**Pending deploy:** N/A — no deploy target confirmed live yet. Local git commits made: 766bc6c, eae9166 (Step 1 only; Step 2 not yet committed).
+**Active step:** Step 2 — CLEAR (code-complete, locally/live verified where possible). Still blocked on: real OANDA credentials, supabase functions deploy, pg_cron/pg_net enablement on the live project, actual Cloudflare deploy — all owner/Arch-side, no further code changes needed once unblocked.
+**Last cleared:** Step 2 — 2026-08-30, Richard's round-2 re-review (SSRF fix confirmed with no bypass)
+**Pending deploy:** N/A — no deploy target confirmed live yet. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd (Step 2).
 
 ---
 
