@@ -4,65 +4,53 @@
 
 ## Where We Stopped
 
-Steps 1 and 2 (plus the Step 2 revision swapping the price feed to Binance) are all
-built, reviewed, and clear. Committed through `c227b97`. The XAUUSD price source is
-now Binance's public, keyless PAXG/USDT ticker — no signup, no secrets, unblocks
-everything that was stuck on OANDA account access. `OANDAProvider` stays in the
-codebase, unused, as a documented future upgrade path.
+**Milestone 1 is proven.** The spec's primary success criterion — create an XAUUSD
+alert, laptop off, cloud detects a real crossing, phone receives a push notification
+— is confirmed working end-to-end in production. Full verification (server-side
+`price_alerts`/`notification_log`/`instruments` state, plus the owner's own phone)
+is logged in `handoff/BUILD-LOG.md`'s "Milestone 1 Proof" section.
 
-Nothing is deployed to production yet. What's blocking that, all owner/Arch-side:
-- `pg_cron`/`pg_net` extensions not yet enabled on the live Supabase project.
-- `supabase functions deploy` not yet run against the live project.
-- No confirmed Cloudflare account for the actual `wrangler deploy`.
-- VAPID_SUBJECT contact email — asked owner, no answer yet.
-- A few harmless `push-verify-*@example.com` test users are sitting in the
-  live Supabase project from live verification — owner can delete via the
-  dashboard whenever, not urgent.
+Everything is deployed and live:
+- Web app: https://tradeflow-web.garychanjiayik.workers.dev (Cloudflare Workers)
+- `tick` Edge Function: deployed, scheduled via pg_cron every 2 minutes
+- Code: pushed to https://github.com/GaryChanJiaYik/TradeFlow (branch `main`)
 
-The OANDA/broker-credential blocker is gone — no external account is needed for the
-price feed anymore. Next action: enable pg_cron/pg_net, deploy the function, deploy
-the web app (needs a hosting decision confirmed — Cloudflare or otherwise), then run
-the actual Milestone 1 proof (create a real alert, close the browser, laptop off,
-wait for a real PAXG/USDT crossing, confirm the phone gets the push). No further
-Bob/Richard cycles should be needed for that — it's owner+Arch executing what's
-already built.
+Per the spec's own instruction (section 29): "If YES: the architecture is proven."
+The next conversation should NOT restart infrastructure work — it should move to
+V1's remaining features (Feature B: graph reminders has schema but no UI yet) or
+begin V2 per the roadmap, unless the owner directs otherwise.
 
 ---
 
 ## What Was Decided This Session
 
-- After checking 12 data providers (OANDA, Twelve Data, Finnhub, Alpha Vantage,
-  Massive/Polygon, Alpaca, Public.com, EODHD, QuantHouse, Webull, Capital.com,
-  UniRateAPI) and 3 broker demo signups (OANDA, Capital.com, Deriv) all failing for
-  various reasons (paid-gated data, no forex/commodity support, or account-creation
-  friction/errors/geo-restriction), settled on **Binance's public PAXG/USDT ticker**
-  as V1's XAUUSD source. Pattern found: every retail-friendly "developer API" gates
-  real-time gold/commodity data behind a paid plan; free real-time access only
-  exists via a broker's own demo account or a crypto-market proxy.
-- Explicitly rejected applying a static offset to align Binance's price with OANDA's:
-  the PAXG-vs-spot basis isn't constant and there's no free live OANDA reference to
-  calibrate against, so a fixed offset would drift and could make things worse, not
-  better. Accepted the ~0.1-0.3% gap as-is.
-- `OANDAProvider` kept in the codebase (built, tested, reviewed) as a deliberate,
-  documented, currently-unwired future upgrade path — not deleted.
+- (Carried from before) Binance PAXG/USDT as the XAUUSD source, no offset applied.
+- Owner's network blocks direct Postgres ports (5432/6543) — confirmed via raw TCP
+  tests. `supabase db push`/`migration list` cannot run from this machine; future
+  migrations need the Supabase dashboard SQL Editor instead (HTTPS-based, unaffected).
+- Cloudflare deploy required `shamefully-hoist=true` + `node-linker=hoisted` in a new
+  root `.npmrc` — a documented fix for a pnpm + `@opennextjs/cloudflare` middleware-
+  manifest bug (dynamic `require()` unsupported in the Workers ESM runtime). Confirmed
+  via live `wrangler tail` logs and a matching upstream GitHub issue, not guessed.
+- Web Push subscriptions are per-browser-per-device — the first "Enable notifications"
+  click was on the owner's laptop, which would NOT have survived the laptop being off.
+  Caught before the proof attempt; the owner re-registered from their phone's browser
+  specifically, which is what actually received the notification.
 
 ---
 
-## Still Open
+## Still Open (not blocking, for whenever)
 
-- Owner/Arch: enable `pg_cron`/`pg_net` extensions on the live Supabase project
-  dashboard.
-- Owner: confirm a Cloudflare account, or say if a different free host is
-  preferred instead.
-- Owner: VAPID_SUBJECT contact email.
-- Arch: once the above land, run `supabase functions deploy`, deploy the web
-  app, then the real Milestone 1 laptop-off proof.
-- (Not urgent) Owner: delete leftover `push-verify-*@example.com` test users from
-  the live Supabase project dashboard.
-- (Not urgent, future) If/when OANDA or another broker demo account becomes
-  workable, swap `BinanceProvider` back to `OANDAProvider` (or a new provider) in
-  `supabase/functions/tick/index.ts` — the abstraction makes this a small, isolated
-  change.
+- KG-8 (from Step 2 deployment): the CLI's migration-history table doesn't know about
+  `0001`-`0003` since they were applied via SQL Editor, not `supabase db push`. Keep
+  this in mind for the next migration.
+- Graph reminders (Feature B) has schema (`graph_reminders` table, evaluated by the
+  `tick` function already) but no UI yet — natural next vertical slice.
+- No native mobile app (Web Push to an installed PWA was used instead, per an earlier
+  decision) — still a valid V1 scope choice, revisit only if the owner wants a real
+  app icon/store presence.
+- OANDA (or another broker feed) remains a clean future upgrade via the
+  `MarketDataProvider` abstraction, if broker account access ever gets sorted.
 
 ---
 

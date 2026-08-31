@@ -5,9 +5,39 @@
 
 ## Current Status
 
-**Active step:** DEPLOYED. `tick` Edge Function deployed and scheduled via pg_cron (every 2 min); web app live on Cloudflare Workers at https://tradeflow-web.garychanjiayik.workers.dev. Remaining before Milestone 1 is proven: push code to GitHub (owner setting up remote), then the actual laptop-off proof.
+**Active step:** MILESTONE 1 PROVEN — 2026-08-31. See "Milestone 1 Proof" below. V1's core vertical slice (spec section 29/41) is confirmed working end-to-end in production.
 **Last cleared:** Step 2 revision — 2026-08-31, Richard's round-2 re-review (stray FINNHUB_API_KEY placeholder caught and reverted; swap otherwise clean).
 **Pending deploy:** LIVE as of 2026-08-31. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix).
+
+### Milestone 1 Proof — 2026-08-31
+
+The spec's primary success criterion (section 29/41): "Can I create an XAUUSD price
+alert and receive a notification when the cloud detects the price crossing my target
+while my Windows laptop is completely OFF?" — **YES, confirmed.**
+
+Test performed: owner created a real account (`gary@gary.com`) on the deployed app,
+created a `price_alerts` row (target `4439`, `CROSS_BOTH`, `ONCE`, message "Milestone
+1 test") when the live PAXG/USDT price was `4438.80`, registered a Web Push device
+from their **phone's** browser (not the laptop — the first registration attempt was
+from the laptop and correctly identified as not sufficient for this proof, since a
+laptop-tied push subscription can't be delivered to while the laptop is off), then
+closed the browser and powered off the laptop entirely.
+
+Verified server-side (queried via the Supabase REST API using the test account's own
+session, independent of the owner's laptop):
+- `price_alerts`: `enabled` flipped to `false`, `last_triggered_at` set to
+  `2026-08-31T07:22:00.727Z` — ONCE mode correctly consumed the alert.
+- `notification_log`: one `PRICE_ALERT` row, `status: SENT`, message "XAUUSD crossed
+  4439 upward. Milestone 1 test", `sent_at` matching `last_triggered_at` to the second.
+- `instruments.last_price` progressed `4436.11` (at alert creation time) ->
+  crossed 4439 -> `4442.66` (two ticks later), confirming the cron worker was
+  continuously polling and the crossing was genuine, not a fluke single reading.
+- Owner independently confirmed receiving the actual push notification on their phone
+  while the laptop was off.
+
+This proves the full vertical slice end-to-end in production: Binance price feed ->
+pg_cron-scheduled Edge Function -> `evaluatePriceAlert` -> Web Push -> phone, with
+zero dependency on the owner's laptop, browser, or any running local process.
 
 ### Deployment — 2026-08-31
 
