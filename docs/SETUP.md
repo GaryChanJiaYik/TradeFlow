@@ -103,7 +103,7 @@ Once both env vars are wired up, the dashboard's "Enable notifications"
 button will register the service worker (`apps/web/public/sw.js`), ask for
 permission, subscribe, and persist the subscription to `devices` for the
 signed-in user — this works against a normal `pnpm --filter web dev`, no
-Edge Function or OANDA needed.
+Edge Function or price feed needed.
 
 ## 8. Run the "tick" Edge Function locally
 
@@ -122,9 +122,19 @@ Set up the function's local secrets:
 cp supabase/functions/.env.local.example supabase/functions/.env.local
 ```
 
-Fill in fake-but-well-formed `OANDA_API_TOKEN`/`OANDA_ACCOUNT_ID` (a real
-token isn't needed for local logic verification — see below) and your real
-generated VAPID values from step 7.
+Fill in your real generated VAPID values from step 7. No price-feed
+credentials are needed: the active price source, `BinanceProvider`
+(`packages/market-data/src/binanceProvider.ts`), calls Binance's public,
+keyless `data-api.binance.vision` ticker endpoint — no API key, account, or
+env var required.
+
+*(An OANDA-backed `MarketDataProvider` — `packages/market-data/src/oandaProvider.ts`
+— also exists in the codebase, fully built and reviewed, kept for a
+possible future provider swap. It's not wired into the "tick" function and
+needs no setup here; if it's ever wired back in, it would need
+`OANDA_API_TOKEN`/`OANDA_ACCOUNT_ID`/`OANDA_ENV` added back to this env file
+and `buildBinanceProvider()` in `supabase/functions/tick/index.ts` swapped
+for an OANDA-backed equivalent.)*
 
 **A note on `supabase functions serve` on Windows:** at the time of
 writing, the CLI's Docker-based file-mounting for `supabase functions
@@ -141,10 +151,10 @@ without that container's file-mounting step:
 deno check --config supabase/functions/deno.json supabase/functions/tick/index.ts
 
 # Run it (needs the local stack's URL/service-role key from
-# `npx supabase@latest status`, plus your OANDA/VAPID values):
+# `npx supabase@latest status`, plus your VAPID values; the Binance price
+# fetch itself needs no credentials):
 SUPABASE_URL=http://127.0.0.1:54321 \
 SUPABASE_SERVICE_ROLE_KEY=<from `supabase status`> \
-OANDA_API_TOKEN=... OANDA_ACCOUNT_ID=... OANDA_ENV=practice \
 VAPID_SUBJECT=... VAPID_PUBLIC_KEY=... VAPID_PRIVATE_KEY=... \
 deno run --allow-net --allow-env --config supabase/functions/deno.json supabase/functions/tick/index.ts
 ```
@@ -152,7 +162,7 @@ deno run --allow-net --allow-env --config supabase/functions/deno.json supabase/
 This starts an HTTP listener (default `http://localhost:8000`) you can
 `curl -X POST` directly. See `handoff/BUILD-LOG.md` for the exact local
 verification steps this session ran (seeding a test user/alert/reminder,
-mocking OANDA's response, and confirming the DB updates end-to-end).
+mocking the price-feed response, and confirming the DB updates end-to-end).
 
 When you're done, tear the stack down:
 

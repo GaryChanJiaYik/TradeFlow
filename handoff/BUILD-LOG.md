@@ -5,8 +5,8 @@
 
 ## Current Status
 
-**Active step:** Step 2 — CLEAR (code-complete, locally/live verified where possible). Still blocked on: real OANDA credentials, supabase functions deploy, pg_cron/pg_net enablement on the live project, actual Cloudflare deploy — all owner/Arch-side, no further code changes needed once unblocked.
-**Last cleared:** Step 2 — 2026-08-30, Richard's round-2 re-review (SSRF fix confirmed with no bypass)
+**Active step:** Step 2 (revision) — active price feed swapped from OANDA to Binance PAXG/USDT, code-complete, locally verified, awaiting review. Still blocked on: supabase functions deploy, pg_cron/pg_net enablement on the live project, actual Cloudflare deploy — all owner/Arch-side, no further code changes needed once unblocked. The real-OANDA-credentials blocker from the prior Step 2 entry no longer applies — Binance's public endpoint needs no credentials at all.
+**Last cleared:** Step 2 — 2026-08-30, Richard's round-2 re-review (SSRF fix confirmed with no bypass). The Step 2 revision below (OANDA -> Binance swap) is new since that clearance and awaits its own review.
 **Pending deploy:** N/A — no deploy target confirmed live yet. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd (Step 2).
 
 ---
@@ -73,6 +73,48 @@ Architect notes (2026-08-30): Reviewed Bob's 6 open questions from REVIEW-REQUES
 - **Should Fix** — `apps/web/app/dashboard/page.tsx`'s alerts-listing query had no `.eq("user_id", user.id)`, the same defense-in-depth gap already fixed once on `edit/page.tsx` in Step 1. Added the filter.
 - **Documentation gap** — `handoff/REVIEW-REQUEST.md`'s Files Changed table was missing `supabase/config.toml` and `supabase/.gitignore` (both `supabase init` scaffolding, already reviewed clean by Richard). Added both with a one-line description each.
 - Verified after fix: `pnpm install` (links `vitest` into the new `packages/validation` test setup), `pnpm build`, `pnpm test` (now 23 tests: 8 alert-engine + 6 market-data + 9 validation, all pass), `pnpm typecheck` — all green, repo root.
+
+### Step 2 (revision) — Swap active price feed from OANDA to Binance PAXG — Status: code-complete, locally verified, awaiting review
+*Date: 2026-08-31. Pre-deployment correction to Step 2 (not a new step, not renumbered) — see `handoff/ARCHITECT-BRIEF.md`'s Step 2 revision for the full reasoning: the owner's OANDA practice-account signup, and two alternative broker demo APIs (Capital.com, Deriv), all failed for reasons outside our control after trying 12 providers total. The owner decided to use Binance's public PAXG/USDT ticker as V1's XAUUSD source instead, with no offset/calibration against OANDA — deliberately rejected, since the PAXG-vs-spot basis isn't constant and there's no free live OANDA reference to calibrate against anyway.*
+
+**What changed:**
+
+- **New `BinanceProvider`** (`packages/market-data/src/binanceProvider.ts`): implements `MarketDataProvider` against Binance's public `GET https://data-api.binance.vision/api/v3/ticker/price?symbol=PAXGUSDT` — no API key, secret, or env var of any kind, confirmed reachable with a live `curl` call during this session (`{"symbol":"PAXGUSDT","price":"4423.32000000"}`). Maps `XAUUSD` -> `PAXGUSDT` internally, same one-mapping-per-symbol pattern `OANDAProvider` already used. Parses the `price` string field to a number and throws a typed `BinanceProviderError` (`UNKNOWN_INSTRUMENT` / `HTTP_ERROR` / `INVALID_PRICE`) rather than ever returning/propagating `NaN` — mirrors `OANDAProviderError`'s pattern exactly. New `packages/market-data/src/__tests__/binanceProvider.test.ts` (6 cases, mocked `fetch`): successful parse, HTTP error status, missing `price` field, non-numeric `price` field, unknown instrument (no `fetch` call made), and a no-config-argument construction path (confirms it can default to the global `fetch`, since this provider — unlike OANDA's — takes no required config).
+- **`OANDAProvider` untouched, kept in the codebase** (`packages/market-data/src/oandaProvider.ts` + its own test file) — not wired into anything active, not deleted, per the brief's explicit flag. It remains the concrete example of the provider-swap the `MarketDataProvider` abstraction exists for.
+- **`packages/market-data/src/index.ts`**: added `export * from "./binanceProvider"` alongside the existing OANDA/provider exports.
+- **`supabase/functions/tick/index.ts`**: `buildOandaProvider()` (which read `OANDA_API_TOKEN`/`OANDA_ACCOUNT_ID`/`OANDA_ENV`) replaced with `buildBinanceProvider()` (no env reads at all — Binance's public endpoint is keyless); the one call site, the `catch` block's error-type check (`OANDAProviderError` -> `BinanceProviderError`), and file-header/inline comments mentioning OANDA were updated to Binance. Alert evaluation, push sending, and reminder handling are byte-for-byte unchanged — confirmed via `git diff`, only the provider-related lines differ.
+- **`supabase/functions/.env.local.example`**: removed the `OANDA_API_TOKEN`/`OANDA_ACCOUNT_ID`/`OANDA_ENV` placeholder block, replaced with a comment explaining no price-feed credentials are needed on the active path and where `OANDAProvider` still lives if ever wired back in. Web-Push-related entries (`VAPID_*`) untouched.
+- **`apps/web/.env.local.example`**: no changes — inspected and confirmed it never had OANDA entries to begin with (only Supabase/VAPID keys), so the brief's instruction to remove OANDA placeholders there was a no-op. (Correction, see "Review fix" below: this file was in fact modified during this session — a stray Finnhub block was added by mistake and the review-request claim above was wrong. It has since been reverted; the statement above now reflects the file's actual, correct end state.)
+- **`README.md`**: Status section now describes the active feed as Binance PAXG/USDT (with a pointer to the Step 2 revision for why); Structure section's `market-data`/`functions/tick` one-liners updated; COST/FREE TIER section's OANDA entry replaced with a Binance entry (free/keyless, per-IP rate limit, what happens if exceeded, alternative-provider note) plus a new short OANDA entry documenting it as a built-and-reviewed-but-unwired future option.
+- **`docs/SETUP.md`**: removed the "fill in fake OANDA credentials" step and the `OANDA_API_TOKEN`/`OANDA_ACCOUNT_ID`/`OANDA_ENV` line from the `deno run` local-verification example (Binance needs none); added a short note on where `OANDAProvider` exists and what re-wiring it later would involve, without implying it's required setup.
+
+**Verified this session:**
+
+- `pnpm build`, `pnpm test`, `pnpm typecheck` at repo root — all green. Test count: 29 total (8 alert-engine + 9 validation + 12 market-data — 6 Binance + 6 OANDA, both suites still passing since OANDA's own file/tests were untouched).
+- `deno check --config supabase/functions/deno.json supabase/functions/tick/index.ts` — clean, no type errors, confirming the Deno-side import swap resolves correctly (this file isn't covered by the pnpm-workspace `typecheck` task since it's Deno, not Node).
+- `curl -s "https://data-api.binance.vision/api/v3/ticker/price?symbol=PAXGUSDT"` — live call during this session returned `{"symbol":"PAXGUSDT","price":"4423.32000000"}`, reconfirming Arch's earlier finding that the endpoint needs no auth and is currently up.
+- Grepped the repo (excluding `node_modules`) for `OANDA_API_TOKEN`/`OANDA_ACCOUNT_ID`/`OANDA_ENV`: the only remaining hits are in `docs/SETUP.md` (the intentional "how to wire OANDA back in later" note) and historical handoff docs (`handoff/ARCHITECT-BRIEF.md`, this file, `handoff/SESSION-CHECKPOINT.md`) — none in any active code path, `oandaProvider.ts`/its test file are of course excluded as expected keepers.
+
+**Key decisions this session:**
+
+- Kept `buildBinanceProvider()` as a one-line wrapper function (rather than inlining `new BinanceProvider()` at the call site) to preserve the existing `buildOandaProvider()`-shaped structure and keep a natural place for the comment explaining why no config/env is needed — minimizes the diff's shape versus the reviewed original.
+- `BinanceProviderConfig` has no required fields (unlike `OANDAProviderConfig`'s `apiToken`/`accountId`/`environment`) since the endpoint is genuinely keyless; `fetchFn` is still injectable for tests, defaulting to the global `fetch`.
+- Did not touch `supabase/functions/.env.local` (the untracked, gitignored local secrets file some earlier session created) — it may still contain stale OANDA placeholder values, but nothing reads them anymore and it's not a tracked file the brief asked to update.
+
+**Blocked / Not Attempted:** none new — this revision only touches already-reviewed Step 2 surface area. The pre-existing Step 2 blockers (function deploy, pg_cron/pg_net enablement on the live project, Cloudflare deploy) are unchanged and listed in Current Status above.
+
+**Review fix (2026-08-31):** Richard's review of this revision found one Must Fix —
+`apps/web/.env.local.example` had in fact gained two unrelated lines (a
+`FINNHUB_API_KEY` placeholder and its comment) that were never part of this
+task's scope and aren't referenced anywhere in the codebase, and the Files
+Changed table above wrongly claimed "no change" for that file. Fix applied:
+removed the two Finnhub lines, restoring the file to be byte-for-byte
+identical to its pre-revision content (`git diff` now shows no diff at all
+for this file), and corrected the Files Changed table in
+`handoff/REVIEW-REQUEST.md` by dropping the `apps/web/.env.local.example` row
+entirely, since it no longer differs from `HEAD`. Re-ran `pnpm build`,
+`pnpm test`, `pnpm typecheck` at repo root — all still green (29 tests), as
+expected for an env-example-only revert.
 
 ### Step 1 — Repo scaffold, schema, auth, alert CRUD, alert-engine core — Status: BLOCKED (partial — see below)
 *Date: 2026-08-30*

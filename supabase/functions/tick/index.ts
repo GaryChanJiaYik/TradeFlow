@@ -1,16 +1,16 @@
 // TradeFlow — "tick" Edge Function (Deno). Invoked every 2 minutes by
 // pg_cron (see supabase/migrations/0003_cron.sql) via pg_net. Per
-// invocation: fetches the latest XAUUSD price from OANDA, evaluates it
-// against every enabled/unexpired price_alerts row, evaluates due
-// graph_reminders, sends Web Push notifications for anything that fires,
-// and unconditionally updates instruments.last_price/last_price_at.
+// invocation: fetches the latest XAUUSD price from Binance's public PAXG/USDT
+// ticker, evaluates it against every enabled/unexpired price_alerts row,
+// evaluates due graph_reminders, sends Web Push notifications for anything
+// that fires, and unconditionally updates instruments.last_price/last_price_at.
 //
 // Uses the Supabase **service role** client — this is the one place
 // service-role access is needed, since there's no logged-in user in a cron
 // context and RLS is bypassed by design here (see
 // handoff/ARCHITECT-BRIEF.md Step 2 Decisions).
 //
-// evaluatePriceAlert and OANDAProvider are imported via a *relative
+// evaluatePriceAlert and BinanceProvider are imported via a *relative
 // filesystem path* into the TS source of packages/alert-engine and
 // packages/market-data, not the @tradeflow/* workspace specifiers — Deno
 // executes TypeScript directly and doesn't need node_modules resolution
@@ -25,7 +25,7 @@ import {
   evaluatePriceAlert,
   type EvaluableAlert,
 } from "../../../packages/alert-engine/src/evaluatePriceAlert.ts";
-import { OANDAProvider, OANDAProviderError } from "../../../packages/market-data/src/oandaProvider.ts";
+import { BinanceProvider, BinanceProviderError } from "../../../packages/market-data/src/binanceProvider.ts";
 import { computeNextTriggerAt } from "./nextTrigger.ts";
 
 const XAUUSD_SYMBOL = "XAUUSD";
@@ -36,16 +36,11 @@ function getRequiredEnv(name: string): string {
   return value;
 }
 
-function buildOandaProvider(): OANDAProvider {
-  const environment = Deno.env.get("OANDA_ENV") ?? "practice";
-  if (environment !== "practice") {
-    throw new Error(`Unsupported OANDA_ENV "${environment}" — only "practice" is supported in V1.`);
-  }
-  return new OANDAProvider({
-    apiToken: getRequiredEnv("OANDA_API_TOKEN"),
-    accountId: getRequiredEnv("OANDA_ACCOUNT_ID"),
-    environment,
-  });
+function buildBinanceProvider(): BinanceProvider {
+  // Binance's public ticker endpoint is keyless — no env vars needed. See
+  // handoff/ARCHITECT-BRIEF.md's Step 2 revision for why this replaced
+  // OANDAProvider (which stays in the codebase, unused, for a future swap).
+  return new BinanceProvider();
 }
 
 function configureWebPush(): void {
@@ -278,7 +273,7 @@ Deno.serve(async (_req: Request) => {
     summary.priceAlerts = { skipped: true, reason: "XAUUSD instrument not found or disabled" };
   } else {
     try {
-      const provider = buildOandaProvider();
+      const provider = buildBinanceProvider();
       const tick = await provider.getPrice(instrument.symbol);
 
       summary.priceAlerts = await processPriceAlerts(supabase, instrument, tick.price, now);
@@ -290,14 +285,14 @@ Deno.serve(async (_req: Request) => {
         .update({ last_price: tick.price, last_price_at: tick.timestamp })
         .eq("id", instrument.id);
     } catch (err) {
-      const reason = err instanceof OANDAProviderError ? `${err.code}: ${err.message}` : String(err);
-      console.error("OANDA price fetch failed:", reason);
+      const reason = err instanceof BinanceProviderError ? `${err.code}: ${err.message}` : String(err);
+      console.error("Binance price fetch failed:", reason);
       summary.priceAlerts = { skipped: true, reason };
     }
   }
 
   // --- Graph reminders: time-based, evaluated regardless of whether the
-  // OANDA fetch above succeeded (they don't depend on price). ---
+  // Binance fetch above succeeded (they don't depend on price). ---
   try {
     summary.graphReminders = await processGraphReminders(supabase, now);
   } catch (err) {

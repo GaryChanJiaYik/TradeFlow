@@ -6,11 +6,13 @@ monorepo. See `PROJECT_SPEC.txt` for the full product spec and
 
 ## Status
 
-**Step 2** — live OANDA price feed, the pg_cron-invoked "tick" Edge
-Function, Web Push notifications, and Cloudflare deploy scaffolding. See
-`handoff/BUILD-LOG.md` for exactly what's verified vs. still blocked on
-owner/Arch-side setup (a real OANDA token, function deploy, pg_cron/pg_net
-extension enablement, and an actual Cloudflare deploy).
+**Step 2** — live Binance PAXG/USDT price feed (V1's XAUUSD source; see the
+Step 2 revision in `handoff/ARCHITECT-BRIEF.md` for why OANDA was swapped
+out pre-deployment), the pg_cron-invoked "tick" Edge Function, Web Push
+notifications, and Cloudflare deploy scaffolding. See `handoff/BUILD-LOG.md`
+for exactly what's verified vs. still blocked on owner/Arch-side setup
+(function deploy, pg_cron/pg_net extension enablement, and an actual
+Cloudflare deploy).
 
 ## Structure
 
@@ -20,11 +22,11 @@ apps/
 packages/
   types/               Shared TypeScript types
   validation/          zod schemas mirroring DB constraints
-  market-data/         MarketDataProvider interface + OANDAProvider implementation
+  market-data/         MarketDataProvider interface + BinanceProvider (active) / OANDAProvider (kept for later)
   alert-engine/        Pure evaluatePriceAlert() + its Vitest suite
 supabase/
   migrations/          SQL migrations (schema + RLS + pg_cron schedule)
-  functions/tick/      Edge Function: OANDA price -> alert/reminder evaluation -> Web Push
+  functions/tick/      Edge Function: Binance price -> alert/reminder evaluation -> Web Push
 docs/
   SETUP.md             Local setup instructions
 ```
@@ -66,25 +68,41 @@ free-tier terms can change.*
   self-host Supabase (Postgres + GoTrue) on a low-cost VPS. Neither is
   needed at V1's expected scale.
 
-**OANDA (price feed):**
-- Free tier includes: a practice/demo v20 REST API account is entirely
-  free, with no card required — this is what V1 uses exclusively
-  (`OANDA_ENV=practice`; no "live" trading-account code path exists). OANDA
-  does not publish a hard rate limit for the practice API, but the "tick"
-  Edge Function only calls it once per cron invocation (every 2 minutes ==
-  30 requests/hour), far below any plausible throttling threshold.
-- What happens if exceeded: if OANDA ever rate-limits or the practice
-  account lapses, `OANDAProvider.getPrice` throws a typed
-  `OANDAProviderError` (see `packages/market-data/src/oandaProvider.ts`);
+**Binance (price feed — active in V1):**
+- Free tier includes: `data-api.binance.vision`'s public ticker endpoint
+  (`GET /api/v3/ticker/price?symbol=PAXGUSDT`) is entirely free, keyless,
+  and requires no signup or account at all. V1 uses PAXG/USDT (a
+  gold-backed crypto token, not literally spot gold — see
+  `handoff/ARCHITECT-BRIEF.md`'s Step 2 revision for the accepted tradeoff
+  and why OANDA/Capital.com/Deriv were tried and ruled out first) as its
+  XAUUSD price source. Binance rate-limits this endpoint per IP, but does
+  not publish a fixed number for it; the "tick" Edge Function only calls it
+  once per cron invocation (every 2 minutes == 30 requests/hour), far below
+  any plausible throttling threshold for a single instrument.
+- What happens if exceeded: if Binance ever rate-limits or the endpoint
+  returns an error, `BinanceProvider.getPrice` throws a typed
+  `BinanceProviderError` (see `packages/market-data/src/binanceProvider.ts`);
   the tick function catches it, logs the failure in its response summary,
   and skips only that tick's price-alert evaluation — it does not crash,
   and graph reminders (which don't need a price) still run that tick.
-- Potential paid cost: none at V1's scale — a real trading (live) account
-  is a different, unused product tier and is never touched by this app.
-- Alternative: any other FX/metals price API with a free tier (e.g.
-  Twelve Data, Alpha Vantage) could replace `OANDAProvider` behind the
-  existing `MarketDataProvider` interface without touching the alert-engine
-  or the Edge Function's evaluation logic.
+- Potential paid cost: none — this is a public data mirror with no paid
+  tier to fall into.
+- Alternative: swap `BinanceProvider` for another `MarketDataProvider`
+  implementation (e.g. `OANDAProvider`, already built and reviewed but kept
+  unwired — see below — or another FX/metals price API with a free tier)
+  without touching the alert-engine or the Edge Function's evaluation
+  logic, if Binance's public endpoint ever stops being free/reliable enough.
+
+**OANDA (price feed — documented future option, not currently wired in):**
+- `packages/market-data/src/oandaProvider.ts` implements `MarketDataProvider`
+  against OANDA's v20 practice REST API and is fully built, tested, and
+  reviewed, but is not called from `supabase/functions/tick/index.ts` — it
+  was swapped out pre-deployment for `BinanceProvider` (see the Step 2
+  revision in `handoff/ARCHITECT-BRIEF.md`) after the owner's OANDA practice
+  signup, and two alternative brokers, all failed for reasons outside our
+  control. Kept in the codebase as the concrete example of a future
+  provider swap, not dead code — see `docs/SETUP.md` for how to wire it
+  back in if a real OANDA (or similar) account ever becomes available.
 
 **Cloudflare (hosting — Workers via the OpenNext adapter, not classic
 Pages; see `handoff/REVIEW-REQUEST.md` for why):**
