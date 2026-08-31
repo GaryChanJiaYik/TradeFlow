@@ -4,205 +4,130 @@
 
 ---
 
-## Step 3 — Graph/Chart Reminders UI (spec Feature B, Phase 16)
+## Step 4 — Fix: unauthenticated access to "new alert" / "new reminder" pages
 
-Milestone 1 is proven (see handoff/BUILD-LOG.md "Milestone 1 Proof") and the whole
-pipeline (auth, alert CRUD, cron worker, Web Push) is live in production. This step
-adds the second V1 feature: letting a user create/view/edit/enable/disable/delete
-graph reminders (spec section 16), reusing every pattern already established for price
-alerts. The `graph_reminders` table and its evaluation logic already exist and are
-already running in production (built during Step 2) — this step is UI + one shared
-logic extraction, not new backend architecture.
+Found while spot-checking the live deployment after Step 3: `curl`ing
+`https://tradeflow-web.garychanjiayik.workers.dev/dashboard/alerts/new` and
+`/dashboard/reminders/new` **without any auth cookie** returns HTTP 200 with the full
+create form rendered (confirmed by grepping the response for form field labels like
+"Timeframe"/"Direction"). Compare to `/dashboard` and `/dashboard/reminders` (the list
+pages), which correctly return a 307 redirect to `/login` when unauthenticated.
+
+Root cause: `apps/web/app/dashboard/alerts/new/page.tsx` and
+`apps/web/app/dashboard/reminders/new/page.tsx` are `"use client"` components with no
+server-side auth check at all — unlike every other page in the app, which is a server
+component that calls `supabase.auth.getUser()` and `redirect("/login")` before
+rendering anything (see `apps/web/app/dashboard/page.tsx` and the edit pages,
+`alerts/[id]/edit/page.tsx` / `reminders/[id]/edit/page.tsx`, for the correct
+pattern already used elsewhere). The "new" pages skip this because the whole page
+needs to be a client component for `useFormState`, and whoever wrote the first one
+(Step 1) put the client directive directly on `page.tsx` instead of splitting it the
+way the edit pages already do.
+
+**Practical impact, so this is scoped correctly**: an anonymous visitor can view these
+two form screens, but cannot actually create anything — `createAlertAction` and
+`createReminderAction` (the server actions) both independently derive `user.id` from
+the session and would reject/no-op for an unauthenticated request (confirmed already
+reviewed clear in Steps 1 and 3). This is an authorization/access-control gap (internal
+app UI shouldn't render for logged-out visitors at all) and an inconsistency with the
+rest of the app's defense-in-depth posture — not a data leak or a way to create data
+without an account.
 
 ### Decisions
 
-- **Extract `computeNextTriggerAt` into a shared package** — it currently lives only
-  in `supabase/functions/tick/nextTrigger.ts` (Deno-only). Move the real implementation
-  to `packages/alert-engine/src/computeNextTriggerAt.ts` (same package as
-  `evaluatePriceAlert` — both are pure, I/O-free, tested functions; no new package
-  needed). Update `supabase/functions/tick/index.ts` to import it via the same
-  relative-path pattern already used for `evaluatePriceAlert`
-  (`../../../packages/alert-engine/src/computeNextTriggerAt.ts`), and delete the
-  duplicate implementation from `supabase/functions/tick/nextTrigger.ts` — do not
-  leave two copies. Move `nextTrigger.test.ts`'s test cases to
-  `packages/alert-engine/src/__tests__/computeNextTriggerAt.test.ts` (Vitest, not
-  Deno's test runner) so they run in the same `pnpm test` suite as everything else.
-  Preserve the exact signature and behavior — do not change what "next boundary" means
-  for 15m/1H/4H/1D while moving it.
-- **Validation** (`packages/validation/src/graphReminder.ts`, new): `createGraphReminderSchema`/
-  `updateGraphReminderSchema` — `timeframe` enum `15m|1H|4H|1D` (already defined in
-  `packages/validation/src/enums.ts` — reuse it, don't redefine), `description`
-  optional free text, `timezone` must be a valid IANA zone (validate with
-  `Intl.supportedValuesOf('timeZone').includes(value)` — do not accept an arbitrary
-  string), `enabled` boolean. No `trigger_mode`/`direction`/`target_price` — those are
-  price-alert-only concepts, reminders always recur on their timeframe by design (spec
-  section 16), this is not an ambiguity to flag.
-- **UI pages** (mirror the existing price-alert pages under `apps/web/app/dashboard/`):
-  `reminders/page.tsx` (list — timeframe, description, next occurrence, enabled
-  status, per-row Edit/Enable-Disable/Delete), `reminders/new/page.tsx` (create form —
-  timeframe dropdown, description, timezone defaulting to the browser's detected zone
-  via `Intl.DateTimeFormat().resolvedOptions().timeZone` but editable), 
-  `reminders/[id]/edit/page.tsx` + an edit-form client component (mirror
-  `alerts/[id]/edit/edit-form.tsx`'s pattern). Instrument is fixed to XAUUSD, same as
-  price alerts — no instrument picker.
-- **Server actions** (`apps/web/app/dashboard/reminder-actions.ts`, new, mirroring
-  `dashboard/actions.ts`'s pattern exactly): `createReminderAction`,
-  `updateReminderAction`, `setReminderEnabledAction`, `deleteReminderAction` — all
-  derive `user.id` from the session (never client-supplied), all add an explicit
-  `.eq("user_id", user.id)` filter on top of RLS (the defense-in-depth pattern Richard
-  has required twice now — do not regress on this). On create, and on update if
-  `timeframe` or `timezone` changed, compute `next_trigger_at` using the now-shared
-  `computeNextTriggerAt` and store it — the reminder must have a correct
-  `next_trigger_at` the moment it's saved, not wait for the next cron tick to notice.
-- **Dashboard nav**: add a simple link/tab between "Alerts" and wherever a Reminders
-  section belongs on the existing dashboard so both lists are reachable — a small
-  addition to `apps/web/app/dashboard/page.tsx` or a shared layout, your call on the
-  simplest way that doesn't restructure the existing alerts UI.
+- **Fix pattern**: match what the edit pages already do correctly. Split each `new`
+  page into two files:
+  - `page.tsx` becomes a plain **server component**: `createClient()`, `getUser()`,
+    `redirect("/login")` if no user, then renders the client form component. No other
+    logic — this file should look almost identical to `alerts/[id]/edit/page.tsx`
+    minus the record fetch (there's no existing record for a "new" page).
+  - The existing client component content (the `"use client"` form, `useFormState`,
+    etc.) moves as-is into a new sibling file — `new-alert-form.tsx` /
+    `new-reminder-form.tsx` (matching the existing `edit-form.tsx` naming convention),
+    exported as `NewAlertForm` / `NewReminderForm`, imported and rendered by the new
+    `page.tsx`.
+  - Do not change any form behavior, field logic, or the reminder page's
+    browser-timezone-detection `useEffect` — this is purely moving the same client
+    component behind a server-side auth guard, not a rewrite.
+- **Verify the fix doesn't just move the problem**: after the split, `curl`ing both
+  routes with no auth cookie must return a redirect (307) to `/login`, matching the
+  list pages' behavior — check this for real against the deployed app or a local
+  build, not just by reading the code.
+- **Audit for any other instance of this pattern**: grep `apps/web/app` for
+  `"use client"` at the top of any `page.tsx` file (not a component file) — if any
+  other page has the same shape (client directive directly on the page file, no
+  auth check), flag it as an open question rather than silently fixing or silently
+  ignoring it; this brief only prescribes the fix for the two known instances.
 
 ### Build Order
-1. Extract `computeNextTriggerAt` to `packages/alert-engine`, move its tests, delete
-   the Deno-local duplicate, update `tick/index.ts`'s import.
-2. `packages/validation/src/graphReminder.ts` + unit tests (valid/invalid timeframe,
-   valid/invalid IANA timezone, optional description).
-3. `reminders/page.tsx`, `reminders/new/page.tsx`, `reminders/[id]/edit/page.tsx` +
-   edit-form component.
-4. `dashboard/reminder-actions.ts` (the four server actions).
-5. Dashboard nav link between Alerts and Reminders.
-6. `apps/web/e2e/reminder-crud.spec.ts` (Playwright) — sign up (or reuse the existing
-   alert-crud spec's pattern), create a reminder, see it listed, edit it, delete it.
+1. Split `alerts/new/page.tsx` → `alerts/new/page.tsx` (server, auth-gated) +
+   `alerts/new/new-alert-form.tsx` (client, existing form content).
+2. Split `reminders/new/page.tsx` → `reminders/new/page.tsx` (server, auth-gated) +
+   `reminders/new/new-reminder-form.tsx` (client, existing form content).
+3. Grep the rest of `apps/web/app` for the same anti-pattern; report findings even if
+   none are found.
+4. Verify both fixed routes redirect when unauthenticated, and still work correctly
+   end-to-end when authenticated (create an alert and a reminder for real against the
+   live Supabase project, same as Steps 1 and 3 did).
 
 ### Flags
-- Flag: Do not duplicate `computeNextTriggerAt` — one implementation, imported by both
-  the web app and the Edge Function. If you find a reason the shared version can't work
-  identically in both environments, stop and escalate rather than forking it.
-- Flag: `packages/validation/src/enums.ts` already has the `timeframe` enum — reuse it.
-- Flag: You now have live access to the real Supabase project (unlike Steps 1-2's
-  blocked state) — verify the CRUD flow for real against it, not just locally, since
-  nothing is blocking that anymore.
+- Flag: This is a fix to already-shipped, already-twice-reviewed code — Richard should
+  treat this with the same rigor as a new security finding, not a rubber-stamp.
+- Flag: Do not add authentication logic to the client form components themselves
+  (e.g. client-side redirect-if-no-session) — the server-component guard is the
+  correct, sufficient fix, matching the pattern the edit pages already use. Client-side
+  auth checks are not a real access control (a user can just disable JS / hit the API
+  directly), so don't treat this as belonging there.
 
 ### Definition of Done
-- [ ] `pnpm build`, `pnpm test`, `pnpm typecheck` pass at repo root, including moved
-      `computeNextTriggerAt` tests and new validation tests.
-- [ ] `supabase/functions/tick/nextTrigger.ts`'s duplicate implementation is gone;
-      `tick/index.ts` imports the shared one.
-- [ ] Live-verified against the real Supabase project: sign in, create/edit/enable/
-      disable/delete a graph reminder, confirm `next_trigger_at` is set correctly on
-      create and recomputed correctly when timeframe/timezone changes.
-- [ ] Playwright e2e test passes.
-- [ ] RLS/defense-in-depth confirmed on every new query (Richard will check this).
+- [ ] `pnpm build`, `pnpm test`, `pnpm typecheck` pass at repo root — no test changes
+      expected here (this isn't unit-testable business logic, it's a routing/auth
+      structure fix), but nothing should break.
+- [ ] Unauthenticated `curl` to both `/dashboard/alerts/new` and
+      `/dashboard/reminders/new` returns a redirect, not 200 with form content.
+- [ ] Authenticated create-alert and create-reminder flows still work, verified live.
+- [ ] Grep audit for the same anti-pattern elsewhere in `apps/web/app` reported,
+      whether or not anything else was found.
 
 ---
 
 ## Builder Plan
 *Builder adds their plan here before building. Architect reviews and approves.*
 
-Background run — proceeding straight to build per Arch's dispatch note. Plan recorded
-here for the record; nothing below hits a Flag or an Escalate-to-Arch trigger.
+Confirmed root cause by reading both files: `alerts/new/page.tsx` and
+`reminders/new/page.tsx` are `"use client"` default-export page components with
+`useFormState` directly in them — no `createClient()` / `getUser()` / `redirect`
+anywhere, unlike `alerts/[id]/edit/page.tsx` and `reminders/[id]/edit/page.tsx`
+which are async server components that guard with `if (!user) redirect("/login")`
+before rendering `<EditAlertForm>` / `<EditReminderForm>`.
 
-**1. Extract `computeNextTriggerAt`**
-- Move `supabase/functions/tick/nextTrigger.ts`'s implementation verbatim to
-  `packages/alert-engine/src/computeNextTriggerAt.ts`, export it from
-  `packages/alert-engine/src/index.ts` (alongside the existing
-  `evaluatePriceAlert` re-export).
-- Move `nextTrigger.test.ts`'s 8 cases to
-  `packages/alert-engine/src/__tests__/computeNextTriggerAt.test.ts`, translated from
-  bare `Deno.test`/manual-assert to `describe`/`it`/`expect` (Vitest), matching the
-  style already used in `evaluatePriceAlert.test.ts` (same directory, same import
-  convention: `from "../computeNextTriggerAt.js"`).
-- Delete `supabase/functions/tick/nextTrigger.ts` and `nextTrigger.test.ts` — no
-  duplicate left behind.
-- Update `supabase/functions/tick/index.ts`'s import to
-  `../../../packages/alert-engine/src/computeNextTriggerAt.ts`, same relative-path
-  pattern already used for `evaluatePriceAlert`. No behavior change — pure move.
+Plan (matches the brief's build order exactly, no deviation):
+1. `alerts/new/new-alert-form.tsx` — new file, client component. Move the entire
+   current body of `alerts/new/page.tsx` in verbatim (imports, `initialState`,
+   `SubmitButton`, form JSX), rename the export from `NewAlertPage` (default) to
+   `export function NewAlertForm()`. No logic changes.
+2. `alerts/new/page.tsx` — replace with an async server component mirroring
+   `alerts/[id]/edit/page.tsx`: `createClient()`, `getUser()`, `redirect("/login")`
+   if no user, then `<main><NewAlertForm /></main>`. No record fetch (nothing to
+   fetch for "new").
+3. Same split for `reminders/new/page.tsx` → `reminders/new/new-reminder-form.tsx`
+   (`export function NewReminderForm()`, keeping the `useEffect` timezone-detection
+   logic untouched) + a server-guarded `reminders/new/page.tsx`.
+4. Grep audit `apps/web/app/**/page.tsx` for `^"use client"` — already ran this:
+   hits are `reminders/new/page.tsx`, `alerts/new/page.tsx` (the two being fixed),
+   plus `signup/page.tsx` and `login/page.tsx`. The latter two are intentionally
+   public unauthenticated pages (that's their entire purpose), so they are not
+   instances of this anti-pattern — no other page matches. Will state this
+   explicitly in BUILD-LOG rather than silently dropping it.
+5. Verify: `pnpm build` at repo root; unauthenticated `curl -i` against both
+   routes (locally via `next start`, since I don't have a way to redeploy the
+   live Cloudflare Worker from here) confirming 307 → `/login`; then sign in
+   against the real Supabase project using `apps/web/.env.local` and exercise
+   both authenticated create flows end-to-end (create one real alert, one real
+   reminder), same verification style as Steps 1/3.
+6. Run `pnpm test` / `pnpm typecheck` at repo root.
 
-**2. Validation package**
-- New `packages/validation/src/graphReminder.ts`: `createGraphReminderSchema` /
-  `updateGraphReminderSchema`, reusing `reminderTimeframeSchema` from
-  `./enums.ts`. `timezone`: `z.string().refine(v => Intl.supportedValuesOf("timeZone").includes(v))`.
-  `description`: optional/nullable trimmed string (cap at 500 like price alert's
-  `message`, for consistency — not specified in brief, flagging as a small
-  Builder default). `enabled`: boolean, default `true` on create.
-  No `instrument_id` in the schema (mirrors price alert's update schema omitting
-  it) — instrument is always resolved server-side to XAUUSD.
-- Export from `packages/validation/src/index.ts`.
-- Unit tests in `packages/validation/src/__tests__/graphReminder.test.ts`: valid
-  timeframe values, rejected bogus timeframe, valid IANA timezone (e.g.
-  `Asia/Kuala_Lumpur`, `UTC`), rejected bogus timezone string, optional
-  description (present/absent/empty both fine).
-
-**3. Server actions** (`apps/web/app/dashboard/reminder-actions.ts`, new file,
-mirroring `actions.ts` structurally but not sharing code with it — same as how
-`actions.ts`/`device-actions.ts` are already separate files today):
-- `createReminderAction`, `updateReminderAction` (both `useFormState`-shaped,
-  `{error?: string}`), `setReminderEnabledAction`, `deleteReminderAction` (both
-  plain `FormData -> void` mirroring `setAlertEnabledAction`/`deleteAlertAction`).
-- Each derives `user.id` from `supabase.auth.getUser()`, never trusts client
-  input for it; every query adds `.eq("user_id", user.id)` on top of RLS.
-- `createReminderAction` resolves the XAUUSD instrument id the same way
-  `getXauUsdInstrumentId` does in `actions.ts` (small local copy of that helper —
-  not extracting a shared util since the brief doesn't ask for that and the two
-  action files are already independent), computes `next_trigger_at` via
-  `computeNextTriggerAt(timeframe, timezone, new Date())`, and inserts.
-- `updateReminderAction` re-fetches nothing extra: it always recomputes
-  `next_trigger_at` when `timeframe` or `timezone` in the submitted form differs
-  from the current row's stored values (fetch-before-update, compare, then
-  conditionally recompute) — since the form is a full edit form (not partial
-  PATCH), the simplest correct rule is "recompute whenever either field's
-  submitted value differs from the existing row," per the brief's "on update if
-  timeframe or timezone changed."
-
-**4. UI pages** (mirroring `apps/web/app/dashboard/alerts/*`):
-- `apps/web/app/dashboard/reminders/page.tsx` — server component, table columns:
-  Timeframe, Description, Next occurrence (`next_trigger_at` formatted via the
-  same `toLocaleString()` helper style as the alerts list), Status badge,
-  Actions (Edit / Enable-Disable / Delete), same table/badge/actions CSS classes
-  already in `globals.css` (no new CSS needed for the list).
-- `apps/web/app/dashboard/reminders/new/page.tsx` — client form: timeframe
-  `<select>` (15m/1H/4H/1D), description `<textarea>` optional, timezone text
-  input defaulting to the browser's detected zone. To avoid an SSR/client
-  hydration mismatch (server has no meaningful "browser timezone"), the input
-  starts as an empty controlled value and is populated via `useEffect` after
-  mount with `Intl.DateTimeFormat().resolvedOptions().timeZone` — same
-  zero-mismatch pattern as any client-only default. Still editable/required
-  before submit.
-- `apps/web/app/dashboard/reminders/[id]/edit/page.tsx` +
-  `edit-form.tsx` — same shape as `alerts/[id]/edit/`, pre-filled from the
-  fetched row (`defaultValue`s, no hydration concern since these are real
-  server-fetched values, not client-detected ones).
-- Instrument is not shown as a form field anywhere (fixed to XAUUSD per brief);
-  the list table does show an "Instrument" column (XAUUSD) for parity with the
-  alerts list, since the underlying row still has `instrument_id`.
-
-**5. Dashboard nav**
-- Simplest option that touches the least: on `dashboard/page.tsx`'s existing
-  `top-bar .actions` row, add a `<Link className="btn btn-secondary" href="/dashboard/reminders">Reminders</Link>`
-  next to "New alert"/"Log out". On the new `reminders/page.tsx`'s equivalent
-  top bar, add the mirror-image `<Link ... href="/dashboard">Alerts</Link>`. No
-  new CSS classes, no shared layout/nav component — each page just links to the
-  other, which is enough for "both lists are reachable" without restructuring
-  the existing alerts UI.
-
-**6. E2E test** — `apps/web/e2e/reminder-crud.spec.ts`, same sign-up-fresh-user
-structure as `alert-crud.spec.ts`: sign up, create a reminder (timeframe +
-description), see it listed, edit it (change description, assert new text
-shown), delete it, assert gone.
-
-**Open items / small Builder defaults (flagging, not blocking):**
-- Capping `description` at 500 chars — not specified in the brief; matching
-  price alert's `message` cap for consistency. Will change if Arch/Richard wants
-  unlimited or a different cap.
-- Platform quirk found while implementing the timezone validator: the brief's
-  literal `Intl.supportedValuesOf("timeZone").includes(value)` check rejects
-  `"UTC"` — Node/ECMA-402 doesn't enumerate the bare `"UTC"` alias in that
-  list (it resolves to `Etc/UTC`), even though `Intl.DateTimeFormat` itself
-  accepts `"UTC"` as a `timeZone` fine. This matters because `"UTC"` is the
-  `graph_reminders.timezone` column's own DB default. Resolved by special-
-  casing `value === "UTC"` in addition to the `supportedValuesOf` check
-  (`packages/validation/src/graphReminder.ts`) rather than escalating — the
-  correct behavior here isn't a judgment call (UTC is unambiguously a valid
-  timezone), just a gap in what that one API enumerates.
-- "Recompute next_trigger_at when timeframe or timezone changed" is implemented
-  as "recompute whenever the submitted value differs from the current row,"
-  evaluated inside `updateReminderAction` before the `.update()` call.
+No open decisions — the brief's fix pattern is unambiguous and the audit is
+already done above. Proceeding directly (background run per instruction).
 
 Architect approval: [ ] Approved / [ ] Redirect — see notes below

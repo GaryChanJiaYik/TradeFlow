@@ -1,4 +1,4 @@
-# Review Feedback — Step 3
+# Review Feedback — Step 4
 *Written by Reviewer. Read by Builder and Architect.*
 
 Date: 2026-08-31
@@ -14,18 +14,7 @@ None.
 ## Should Fix
 [Does not block. Fix inline if under 5 minutes, otherwise log to BUILD-LOG.]
 
-- `packages/validation/src/graphReminder.ts:9-14` (comment above
-  `isValidIanaTimeZone`) — the comment says `"UTC"` "resolves to" `Etc/UTC`
-  in the tzdb and implies `Etc/UTC` is one of the values
-  `Intl.supportedValuesOf("timeZone")` enumerates. Checked directly (Node
-  24.19.0): `Intl.supportedValuesOf("timeZone")` does not contain `Etc/UTC`
-  either — there are no `Etc/*` entries in the list at all on this runtime,
-  even though `new Intl.DateTimeFormat(undefined, { timeZone: "Etc/UTC" })`
-  is accepted fine. Doesn't change behavior or create a security/logic gap
-  (the code doesn't rely on `Etc/UTC` being in the list — it only
-  special-cases the bare string `"UTC"`, which is exactly what was needed),
-  just a comment claim that isn't accurate on this runtime. Reword to drop
-  the "resolves to Etc/UTC, which the list does carry" implication.
+None.
 
 ## Escalate to Architect
 [Product or business decision required — not a code decision.]
@@ -34,111 +23,85 @@ None.
 
 ## Cleared
 
-- **`computeNextTriggerAt` extraction** — diffed
-  `packages/alert-engine/src/computeNextTriggerAt.ts` against the deleted
-  `supabase/functions/tick/nextTrigger.ts` at its last commit (`git show
-  0df58cd:supabase/functions/tick/nextTrigger.ts`). The entire function body
-  (`getWallClock`, `zonedWallClockToUtc`, `computeNextTriggerAt`, and the
-  `TIMEFRAME_MINUTES` table) is byte-for-byte identical. The only textual
-  difference is the local `export type ReminderTimeframe = "15m" | "1H" |
-  "4H" | "1D"` being replaced with `import type { ReminderTimeframe } from
-  "@tradeflow/types"` plus an added doc-comment paragraph — confirmed
-  `packages/types/src/enums.ts:10` defines the exact same union, so this is
-  a pure relocation, not a drifted reimplementation. Confirmed both
-  `supabase/functions/tick/nextTrigger.ts` and `nextTrigger.test.ts` are
-  actually deleted (`git status` shows `D`, not present on disk), and
-  `supabase/functions/tick/index.ts:29` imports the shared file via the same
-  relative-path pattern already used for `evaluatePriceAlert`
-  (`../../../packages/alert-engine/src/computeNextTriggerAt.ts`) and calls
-  it at line 243 inside `processGraphReminders` — no duplicate
-  implementation left anywhere. `packages/alert-engine/src/index.ts` now
-  re-exports it alongside `evaluatePriceAlert`. The translated test file
-  (`packages/alert-engine/src/__tests__/computeNextTriggerAt.test.ts`) keeps
-  the same 9 cases (UTC boundary floor/advance for 15m/1H/4H/1D, a fixed
-  +8 zone for 1D and 4H, a US DST fall-back case, and the future-instant
-  sanity check) — read in full, no coverage silently dropped in the
-  translation. `pnpm -w test` at repo root: all 6 workspace packages pass
-  (alert-engine 17, validation 27, market-data 12, plus web build/typecheck),
-  matching Bob's claimed count. `pnpm --filter web typecheck` also clean.
+- **Auth guard structure, both new `page.tsx` files** — read
+  `apps/web/app/dashboard/alerts/new/page.tsx` and
+  `apps/web/app/dashboard/reminders/new/page.tsx` in full (17 lines each,
+  no `"use client"` directive — genuine Server Components). Both are:
+  `createClient()` → `await supabase.auth.getUser()` → `if (!user)
+  redirect("/login")` → render `<main><NewXForm /></main>`. There is no
+  code before the check (no early return, no conditional that could skip
+  it) and nothing after the guard except the render — `redirect()` throws
+  in Next.js, so there is no fall-through path that reaches
+  `<NewAlertForm />`/`<NewReminderForm />` without a resolved `user`.
+  Confirmed `createClient` (`apps/web/lib/supabase/server.ts`) is the
+  cookie-backed server client (`createServerClient` from `@supabase/ssr`
+  reading `next/headers` cookies), not the browser client — the same
+  primitive the already-correct `alerts/[id]/edit/page.tsx` uses.
+  Diffed the new pages against `alerts/[id]/edit/page.tsx`: identical
+  shape minus the `.from(...).select(...).eq("id", ...).eq("user_id",
+  ...)` fetch and `notFound()` check, which is correctly absent here since
+  a "new" page has no record to fetch. Structurally equivalent to the
+  proven-correct pattern, not just similar-looking.
 
-- **UTC timezone special case** — `isValidIanaTimeZone` in
-  `packages/validation/src/graphReminder.ts:20-22` is `value === "UTC" ||
-  Intl.supportedValuesOf("timeZone").includes(value)`, i.e. exact
-  case-sensitive equality to the literal string `"UTC"`, not a prefix/regex
-  match that could widen acceptance. Verified directly against the actual
-  runtime (Node 24.19.0, matches what the app runs on):
-  `Intl.supportedValuesOf("timeZone")` does not contain `"UTC"`, `"utc"`, or
-  `"Etc/UTC"` — confirms Bob's claimed platform quirk is real, not
-  fabricated. Ran the validator function against real invalid/edge inputs:
-  `"utc"` (lowercase) → **rejected**, `"Etc/UTC"` → rejected (a false
-  negative for a technically-valid zone, but not a widening — see Should Fix
-  above), `"UTC"` → accepted, and genuinely bogus strings `"Not/A_Zone"`,
-  `"GMT+8"`, `"Nonsense/Timezone"` → all **rejected**. The existing test
-  suite (`packages/validation/src/__tests__/graphReminder.test.ts`) also
-  covers a bogus zone and a fixed-offset-style string as separate rejection
-  cases, and both create/update schemas share the same `timezoneSchema`, so
-  the special case can't be accidentally bypassed via one code path. This is
-  a narrow, correctly-scoped workaround for a real platform gap, not a
-  validation loophole.
+- **Form components are pure moves, not rewrites** — diffed
+  `new-alert-form.tsx` and `new-reminder-form.tsx` against the previous
+  committed `alerts/new/page.tsx` / `reminders/new/page.tsx` bodies
+  (`git show HEAD:...`). The only changes in both files: `export default
+  function NewXPage()` → `export function NewXForm()`, and the `<main>...
+  </main>` wrapper removed (now supplied by the page). Every import,
+  `initialState`, `SubmitButton`, `useFormState` call, field, label,
+  `name`/`id` attribute, validation attribute (`required`, `min`,
+  `maxLength`, etc.), and the `actions`/cancel-link markup is
+  character-for-character identical. In `new-reminder-form.tsx`
+  specifically, the `useEffect(() => setTimezone(Intl.DateTimeFormat()
+  .resolvedOptions().timeZone), [])` browser-timezone-detection hook and
+  its preceding comment are present and untouched — confirmed by direct
+  diff, not by description alone.
 
-- **`reminder-actions.ts` authorization pattern** — read the full file
-  (`apps/web/app/dashboard/reminder-actions.ts`) and compared it line-by-line
-  against the already-cleared `apps/web/app/dashboard/actions.ts` (Step 1).
-  Every one of the four actions (`createReminderAction`,
-  `updateReminderAction`, `setReminderEnabledAction`,
-  `deleteReminderAction`) calls `supabase.auth.getUser()` and redirects to
-  `/login` if absent, uses only the resulting `user.id` (never a client-
-  supplied field) for `user_id`, and every `select`/`update`/`delete` on
-  `graph_reminders` chains an explicit `.eq("user_id", user.id)` on top of
-  RLS — matching the Step 1 pattern exactly (`updateReminderAction`
-  additionally fetches the existing row scoped by `id` **and** `user_id`
-  before recomputing, which is at least as strict as Step 1's
-  `updateAlertAction`, not looser). The two server-component pages
-  (`reminders/page.tsx:28`, `reminders/[id]/edit/page.tsx:19-20`) apply the
-  same `.eq("user_id", user.id)` filter when fetching for display/edit
-  pre-fill. No path found where a reminder ID from form input or the URL
-  param is used without a `user_id` filter alongside it.
+- **Independent grep audit, `"use client"` on `page.tsx`** — ran the grep
+  myself (`Grep` tool with glob `page.tsx` over `apps/web/app`, and
+  separately `find apps/web/app -name page.tsx | xargs grep -l
+  '"use client"'` as a second method) rather than trusting Bob's count.
+  Both return exactly two hits: `apps/web/app/login/page.tsx` and
+  `apps/web/app/signup/page.tsx`. Read both in full: neither does a
+  `getUser()`/auth check, but neither renders anything user-specific or
+  privileged — plain email/password forms with no data fetch, calling
+  `logInAction`/`signUpAction`. Being reachable while logged out is their
+  entire purpose (an already-authenticated user hitting `/login` is a
+  UX nicety to handle, not a security gap — no comparison here to
+  something that should have redirected). Confirms Bob's claimed audit
+  result independently; no other instance of the anti-pattern exists.
 
-- **`next_trigger_at` computation** — `createReminderAction` computes it
-  via `computeNextTriggerAt(parsed.data.timeframe, parsed.data.timezone,
-  now)` and includes it directly in the insert payload (not left for the
-  first cron tick to fill in). `updateReminderAction` fetches the existing
-  `timeframe`/`timezone`, compares against the submitted values, and only
-  recomputes/overwrites `next_trigger_at` when either actually changed —
-  an edit that only touches `description`/`enabled` leaves the existing
-  schedule alone, which is correct (recomputing unconditionally from "now"
-  on every edit would silently reset/delay a user's schedule for
-  unrelated edits). Matches Bob's live-DB verification claims in
-  `REVIEW-REQUEST.md` (1H/Asia/Kuala_Lumpur create matched to the
-  millisecond; timeframe+timezone change on update recomputed correctly) —
-  not independently re-run against the live project this round (no live
-  Supabase access from this review), but the code path matches exactly what
-  was described and is internally consistent with the schema/action code.
+- **Live behavioral verification (not just code inspection)** — ran
+  `pnpm build` myself against the real `apps/web/.env.local` Supabase
+  project: clean build, and the route table shows both
+  `/dashboard/alerts/new` and `/dashboard/reminders/new` as `ƒ`
+  (dynamic/server-rendered), matching every other authenticated dashboard
+  route (`/dashboard`, `/dashboard/alerts/[id]/edit`,
+  `/dashboard/reminders/[id]/edit`) — `/login` and `/signup` remain `○`
+  (static), consistent with them being genuinely public. Then ran `next
+  start` locally and `curl -i` both routes with zero cookies: both
+  returned `307 Temporary Redirect` with `Location: /login`, byte-for-byte
+  matching the existing correct `/dashboard` baseline I curled alongside
+  them for comparison. Grepped the response bodies for form tells
+  (`target_price`, `Timeframe`, `New XAUUSD`, `Create alert`, `Create
+  reminder`) — zero matches in either response; the body is only the
+  standard Next.js redirect/404 shell with a `NEXT_REDIRECT;replace;
+  /login;307` digest, no field labels or form markup. This directly
+  reproduces Arch's original finding being closed, independently of
+  Bob's own account of the same test. Also ran `tsc --noEmit` across the
+  workspace myself: exit 0, clean.
 
-- **Validation tests non-tautological** — read
-  `packages/validation/src/__tests__/graphReminder.test.ts` in full (18
-  cases). Each asserts a real accept/reject outcome against realistic input
-  (valid timeframes, an invalid timeframe, valid IANA zones including UTC,
-  a bogus zone, a fixed-offset string, missing/null/empty/over-length
-  description, create's `enabled` default vs. update's required `enabled`)
-  — none simply re-assert a hardcoded value against itself.
+- **Scope discipline** — `git status` shows exactly the files described:
+  two modified `page.tsx` (now server components) and two new form
+  component files, plus the three handoff docs. No unrelated files
+  touched, no drift beyond the stated fix.
 
-- **E2E spec exercises real CRUD** — read
-  `apps/web/e2e/reminder-crud.spec.ts` in full: signs up a fresh user,
-  navigates via the real "Reminders" nav link, creates a reminder through
-  the real form, asserts it appears in the list with the correct timeframe,
-  edits the description through the real edit form, asserts the list
-  reflects the change, deletes it, and asserts the row is gone. Exercises
-  the actual `reminder-actions.ts` server actions end-to-end through the UI,
-  not a mocked shortcut — same structure as the already-cleared
-  `alert-crud.spec.ts`.
-
-- **Nav / dependency wiring** — `apps/web/app/dashboard/page.tsx` diff is
-  exactly the claimed +3 lines (a "Reminders" link in the top-bar actions
-  row). `apps/web/package.json` gained exactly one new dependency line
-  (`@tradeflow/alert-engine: workspace:*`), and `pnpm-lock.yaml`'s diff is
-  exactly 3 added lines resolving that new workspace link — no unrelated
-  lockfile churn. `git status` shows only the files Bob's Files Changed list
-  describes (no undisclosed drift into other files).
-
-**Step 3 is clear**, aside from the one cosmetic comment-wording nit above (Should Fix, non-blocking).
+**Step 4 is clear.** The guard is structurally and behaviorally
+equivalent to the already-proven-correct edit-page pattern, the form
+extraction is a verified pure move with the timezone-detection effect
+intact, the "use client"-on-page.tsx anti-pattern is confirmed fully
+eradicated outside the two intentionally-public auth pages, and I
+independently reproduced the 307-redirect-with-no-form-content result
+against a real local production build on the live Supabase project
+rather than relying on Bob's report of the same test.

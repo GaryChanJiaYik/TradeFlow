@@ -5,9 +5,9 @@
 
 ## Current Status
 
-**Active step:** Step 3 — Graph/Chart Reminders UI — Status: code-complete, live-verified against the real Supabase project, awaiting review. See "Step 3" entry below.
+**Active step:** Step 4 — Fix: unauthenticated access to "new alert"/"new reminder" pages — Status: code-complete, live-verified against the real Supabase project, awaiting review. See "Step 4" entry below.
 **Last cleared:** Step 2 revision — 2026-08-31, Richard's round-2 re-review (stray FINNHUB_API_KEY placeholder caught and reverted; swap otherwise clean). Milestone 1 (see "Milestone 1 Proof" below) is proven and live in production.
-**Pending deploy:** Milestone 1 (Steps 1-2) LIVE as of 2026-08-31. Step 3 is built and verified locally/against the live Supabase project but **not yet deployed to Cloudflare** — per Arch's dispatch note, Arch handles the redeploy after review clears. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix). Step 3 not yet committed — see this session's uncommitted working tree.
+**Pending deploy:** Milestone 1 (Steps 1-2) LIVE as of 2026-08-31. Step 3 and Step 4 are built and verified locally/against the live Supabase project but **not yet deployed to Cloudflare** — per Arch's dispatch note, Arch handles the redeploy after review clears. This means the live deployment currently still has the Step 4 vulnerability (unauthenticated visitors can view, but not submit, the two create-form pages) until Arch redeploys. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix). Step 3 and Step 4 not yet committed — see this session's uncommitted working tree.
 
 ### Milestone 1 Proof — 2026-08-31
 
@@ -56,6 +56,96 @@ zero dependency on the owner's laptop, browser, or any running local process.
 ---
 
 ## Step History
+
+### Step 4 — Fix: unauthenticated access to "new alert"/"new reminder" pages — Status: code-complete, live-verified, awaiting review
+*Date: 2026-08-31. Background run per Arch's dispatch. Security/authorization fix, not a new feature — see `handoff/ARCHITECT-BRIEF.md`'s Step 4 for full root-cause writeup. Builder Plan recorded in `handoff/ARCHITECT-BRIEF.md`'s Builder Plan section before building.*
+
+**What changed:**
+
+- **Root cause confirmed by reading the code**: `apps/web/app/dashboard/alerts/new/page.tsx`
+  and `apps/web/app/dashboard/reminders/new/page.tsx` were `"use client"` default-export
+  page components with no server-side auth check — unlike every other page in the app
+  (`dashboard/page.tsx`, both `[id]/edit/page.tsx` files), which are async server
+  components that call `supabase.auth.getUser()` and `redirect("/login")` before
+  rendering. This let an unauthenticated visitor receive a 200 with the full create-form
+  HTML (confirmed live: Arch's brief cites the production `curl` result; this session
+  reproduced it locally against a fresh `pnpm build` + `pnpm start` before the fix, then
+  confirmed 307 after).
+- **`apps/web/app/dashboard/alerts/new/new-alert-form.tsx`** (new file) — the exact
+  former body of `alerts/new/page.tsx` (imports, `initialState`, `SubmitButton`, the
+  form JSX), moved verbatim, default export renamed to a named export
+  `NewAlertForm`. No logic, field, or behavior changes.
+- **`apps/web/app/dashboard/alerts/new/page.tsx`** (rewritten) — now a plain async
+  server component matching `alerts/[id]/edit/page.tsx`'s pattern exactly:
+  `createClient()`, `getUser()`, `redirect("/login")` if no user, then renders
+  `<NewAlertForm />` inside `<main>`. No record fetch (nothing to fetch for "new").
+- **`apps/web/app/dashboard/reminders/new/new-reminder-form.tsx`** (new file) — same
+  treatment for the reminder form, named export `NewReminderForm`. The
+  browser-timezone-detection `useEffect` (defaults the timezone field to
+  `Intl.DateTimeFormat().resolvedOptions().timeZone` after mount, to avoid a
+  hydration mismatch) is preserved byte-for-byte.
+- **`apps/web/app/dashboard/reminders/new/page.tsx`** (rewritten) — same
+  server-guard pattern as the alert page, renders `<NewReminderForm />`.
+- **Anti-pattern audit** (brief's build-order step 3): grepped `apps/web/app/**/page.tsx`
+  for `^"use client"`. Before the fix: 4 hits (`alerts/new`, `reminders/new`,
+  `login`, `signup`). After the fix: 2 hits remain — `app/login/page.tsx` and
+  `app/signup/page.tsx`. Both are intentionally public, unauthenticated-by-design
+  pages (that is their entire purpose — a logged-in-only login page would be
+  nonsensical), so they are correctly excluded from this fix, not a missed instance.
+  No other page in the app matches the anti-pattern.
+
+**Verified live this session:**
+
+- `pnpm build`, `pnpm typecheck`, `pnpm test` — all pass at repo root, no regressions
+  (23 tests unchanged: 8 alert-engine + 6 market-data + 9 validation). Route output
+  confirms both `/dashboard/alerts/new` and `/dashboard/reminders/new` now build as
+  `ƒ` (dynamic, server-rendered) rather than the client-only shape they had before.
+- **Unauthenticated redirect, local production build**: ran `pnpm start` (the real
+  production build, using `apps/web/.env.local`'s real Supabase project — same env
+  the build itself reported using) and `curl -i` both routes with no cookies.
+  Before the fix this returned `200` with full form HTML; after the fix both return
+  `307 Temporary Redirect` with `Location: /login`, byte-for-byte matching
+  `/dashboard`'s existing unauthenticated behavior. Full response body on the 307
+  is the standard Next.js redirect shell — no form field labels or any dashboard
+  content present.
+- **Authenticated create flows, real Supabase project**: ran the repo's existing
+  Playwright e2e specs (`apps/web/e2e/alert-crud.spec.ts` and
+  `reminder-crud.spec.ts`, both pre-existing from Step 3, not modified) against the
+  live project — both pass. Each spec signs up a fresh real user, navigates via the
+  "New alert"/"New reminder" link (i.e. through the now-server-guarded `page.tsx`),
+  fills and submits the form, and confirms the created row appears, can be edited,
+  and can be deleted. This confirms the split didn't break the authenticated path:
+  the server guard correctly lets a real session through, and the client form
+  component works identically to before.
+- Did **not** attempt a live redeploy/curl against the production Cloudflare URL —
+  this session has no `wrangler login`/deploy credentials (same constraint as prior
+  steps); per "Pending deploy" above, Arch redeploys after review. Local
+  `pnpm build`/`pnpm start` against the same `.env.local` config is the closest
+  available proxy and is what the brief's Definition of Done asks to check "for real
+  against the deployed app or a local build."
+
+**Key decisions this session:**
+
+- Followed the brief's prescribed fix pattern exactly (split into server `page.tsx` +
+  sibling client form component, named to match the `edit-form.tsx` convention) —
+  no deviation, no client-side auth check added to the form components (per the
+  brief's explicit flag that this would be insufficient/wrong).
+- Reused the existing Step-3 Playwright specs rather than writing new ones — they
+  already exercise exactly the flow this fix needed to prove still works (navigate
+  to the "new" page while authenticated, create, edit, delete), so a new spec would
+  have been pure duplication for zero added coverage.
+
+**Leftover test data**: this session's Playwright run created two more real test
+users in the live cloud Supabase project (`e2e-<timestamp>@example.com`,
+`e2e-reminder-<timestamp>@example.com`, per those specs' existing naming) — same
+shape as KG-6/KG-9 below, harmless, `graph_reminders`/`price_alerts` rows were
+deleted by the specs' own delete step, only the `auth.users` rows remain. No
+service-role key available in this session to clean them up.
+
+**Blocked / Not Attempted:** none — this step had no blockers; full live Supabase
+access was available throughout.
+
+---
 
 ### Step 3 — Graph/Chart Reminders UI (spec Feature B, Phase 16) — Status: code-complete, live-verified, awaiting review
 *Date: 2026-08-31. Background run per Arch's dispatch — full live Supabase access, no blockers like Steps 1-2. Builder Plan recorded in `handoff/ARCHITECT-BRIEF.md`'s Builder Plan section before building.*
@@ -336,6 +426,8 @@ Once the owner hands over the Supabase project URL and anon key, the remaining D
 - **KG-6** — A handful of `push-verify-*@example.com` test users (each with one `devices` row) were created in the **real** cloud Supabase project while verifying the Web Push subscribe flow live (see Step 2 entry). Harmless test data, not cleaned up — this session has no service-role key for that project. Owner/Arch can delete them from the Supabase Auth dashboard if desired. — logged 2026-08-30
 - **KG-7** — `VAPID_SUBJECT`'s real `mailto:` contact address is undecided; a placeholder (`mailto:fake-placeholder@example.com` / `mailto:placeholder@example.com`) is used in `.env.local.example` files and was used for local testing. See open question in `handoff/REVIEW-REQUEST.md`. — logged 2026-08-30
 - **KG-9** — A handful more test users (`e2e-reminder-*@example.com`, `verify-reminder-*@example.com`) were created in the **real** cloud Supabase project while running Step 3's Playwright e2e tests and a one-off live-verification script (see Step 3 entry above). Same shape as KG-6: harmless, no real user data, not cleaned up (no service-role key in this session). The `graph_reminders`/`devices` rows those tests created were deleted by the tests themselves (delete is part of the CRUD flow being tested); only the `auth.users` rows remain. Owner/Arch can delete via the Supabase Auth dashboard if desired. — logged 2026-08-31
+- **KG-10** — Two more test users (`e2e-<timestamp>@example.com`, `e2e-reminder-<timestamp>@example.com`) were created in the **real** cloud Supabase project while re-running the existing Step 3 Playwright specs to verify Step 4's fix. Same shape as KG-6/KG-9: harmless, `price_alerts`/`graph_reminders` rows self-deleted by the specs, only `auth.users` rows remain, no service-role key in this session to clean up. Owner/Arch can delete via the Supabase Auth dashboard. — logged 2026-08-31
+- **KG-11** — Step 4's fix is not yet live on the production Cloudflare deployment (see "Pending deploy" above) — this session had no `wrangler deploy` credentials. Until Arch redeploys, `https://tradeflow-web.garychanjiayik.workers.dev/dashboard/alerts/new` and `/dashboard/reminders/new` remain unauthenticated-accessible in production, same as when Arch's brief found them. Fix is code-complete and verified against a local production build; only the deploy step remains, same constraint as Step 3's UI. — logged 2026-08-31
 
 ---
 
