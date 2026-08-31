@@ -38,6 +38,9 @@ export default async function DashboardPage() {
           <p className="muted">{user.email}</p>
         </div>
         <div className="actions">
+          <Link className="btn btn-secondary" href="/dashboard/reminders">
+            Reminders
+          </Link>
           <Link className="btn" href="/dashboard/alerts/new">
             New alert
           </Link>

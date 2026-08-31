@@ -5,9 +5,9 @@
 
 ## Current Status
 
-**Active step:** MILESTONE 1 PROVEN — 2026-08-31. See "Milestone 1 Proof" below. V1's core vertical slice (spec section 29/41) is confirmed working end-to-end in production.
-**Last cleared:** Step 2 revision — 2026-08-31, Richard's round-2 re-review (stray FINNHUB_API_KEY placeholder caught and reverted; swap otherwise clean).
-**Pending deploy:** LIVE as of 2026-08-31. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix).
+**Active step:** Step 3 — Graph/Chart Reminders UI — Status: code-complete, live-verified against the real Supabase project, awaiting review. See "Step 3" entry below.
+**Last cleared:** Step 2 revision — 2026-08-31, Richard's round-2 re-review (stray FINNHUB_API_KEY placeholder caught and reverted; swap otherwise clean). Milestone 1 (see "Milestone 1 Proof" below) is proven and live in production.
+**Pending deploy:** Milestone 1 (Steps 1-2) LIVE as of 2026-08-31. Step 3 is built and verified locally/against the live Supabase project but **not yet deployed to Cloudflare** — per Arch's dispatch note, Arch handles the redeploy after review clears. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix). Step 3 not yet committed — see this session's uncommitted working tree.
 
 ### Milestone 1 Proof — 2026-08-31
 
@@ -56,6 +56,123 @@ zero dependency on the owner's laptop, browser, or any running local process.
 ---
 
 ## Step History
+
+### Step 3 — Graph/Chart Reminders UI (spec Feature B, Phase 16) — Status: code-complete, live-verified, awaiting review
+*Date: 2026-08-31. Background run per Arch's dispatch — full live Supabase access, no blockers like Steps 1-2. Builder Plan recorded in `handoff/ARCHITECT-BRIEF.md`'s Builder Plan section before building.*
+
+**What changed:**
+
+- **Extracted `computeNextTriggerAt`** from `supabase/functions/tick/nextTrigger.ts` (Deno-only) to
+  `packages/alert-engine/src/computeNextTriggerAt.ts` (new), exported from
+  `packages/alert-engine/src/index.ts` alongside `evaluatePriceAlert`. Implementation and
+  behavior are byte-for-byte unchanged — only the import of `ReminderTimeframe` was
+  switched from a locally-redefined type to the shared one in `@tradeflow/types`
+  (already a dependency of `alert-engine`, same as `evaluatePriceAlert` importing
+  `PriceAlert` from there). `supabase/functions/tick/nextTrigger.ts` and
+  `nextTrigger.test.ts` deleted — no duplicate left behind.
+  `supabase/functions/tick/index.ts`'s import updated to
+  `../../../packages/alert-engine/src/computeNextTriggerAt.ts`, the same relative-path
+  pattern already used for `evaluatePriceAlert`.
+- **Moved the 9 test cases** from `nextTrigger.test.ts` (bare `Deno.test` + manual
+  asserts) to `packages/alert-engine/src/__tests__/computeNextTriggerAt.test.ts`
+  (Vitest `describe`/`it`/`expect`), so they run in the same `pnpm test` suite as
+  everything else. Same coverage: UTC/`+8`/DST-fall-back boundary cases across all
+  four timeframes, plus the "always strictly future" invariant.
+- **New `packages/validation/src/graphReminder.ts`**: `createGraphReminderSchema`/
+  `updateGraphReminderSchema`, reusing `reminderTimeframeSchema` from `./enums.ts`
+  (not redefined). `timezone` validated against
+  `Intl.supportedValuesOf("timeZone")`, **plus an explicit `"UTC"` special case** —
+  see "Platform quirk" below. `description` optional/nullable, capped at 500 chars
+  (matching price alert's `message` cap, not separately specified in the brief).
+  18 new tests in `packages/validation/src/__tests__/graphReminder.test.ts`: valid/
+  invalid timeframe, valid/invalid IANA timezone (including the UTC case and a fake
+  `GMT+8`-style non-IANA string), optional/null/empty/over-length description,
+  create's `enabled` default vs. update's required `enabled`.
+- **New `apps/web/app/dashboard/reminder-actions.ts`**: `createReminderAction`,
+  `updateReminderAction`, `setReminderEnabledAction`, `deleteReminderAction` —
+  structurally mirrors `actions.ts` (own local `getXauUsdInstrumentId` copy, not a
+  shared util, matching how `actions.ts`/`device-actions.ts` are already independent
+  files). Every query derives `user.id` from `supabase.auth.getUser()` and adds an
+  explicit `.eq("user_id", user.id)` on top of RLS. `createReminderAction` computes
+  `next_trigger_at` via `computeNextTriggerAt(timeframe, timezone, new Date())` before
+  insert. `updateReminderAction` fetches the existing row's `timeframe`/`timezone`
+  first and only recomputes `next_trigger_at` when either submitted value differs
+  from what's stored — an edit that only changes `description`/`enabled` doesn't
+  reset the schedule.
+- **New UI pages**, mirroring `apps/web/app/dashboard/alerts/*`:
+  `apps/web/app/dashboard/reminders/page.tsx` (list: Instrument/Timeframe/
+  Description/Next occurrence/Status/Actions), `reminders/new/page.tsx` (create
+  form), `reminders/[id]/edit/page.tsx` + `edit-form.tsx` (edit form). No instrument
+  picker — fixed to XAUUSD, same as price alerts. The new-reminder form's timezone
+  input defaults to the browser's detected zone via `Intl.DateTimeFormat().resolvedOptions().timeZone`,
+  applied in a `useEffect` after mount (starts as an empty controlled value on both
+  server and client render) to avoid an SSR/client hydration mismatch — still
+  editable before submit.
+- **Dashboard nav**: `apps/web/app/dashboard/page.tsx` gained a "Reminders" link in
+  its `top-bar` actions row; `reminders/page.tsx`'s equivalent row links back to
+  "Alerts". No new CSS, no shared nav component — each page just links to the other.
+- **`apps/web/e2e/reminder-crud.spec.ts`** (new): sign up, create a reminder
+  (timeframe + description), see it listed, edit the description, delete it —
+  mirrors `alert-crud.spec.ts`'s structure.
+- **`apps/web/package.json`**: added `@tradeflow/alert-engine: workspace:*` as a
+  dependency (needed for `reminder-actions.ts`'s `computeNextTriggerAt` import; the
+  web app previously only depended on `@tradeflow/types`/`@tradeflow/validation`).
+  `pnpm install` re-run at root; `pnpm-lock.yaml` diff is 3 lines.
+
+**Platform quirk found and resolved (not escalated — see rationale in Builder Plan):**
+The brief's literal `Intl.supportedValuesOf("timeZone").includes(value)` check
+rejects `"UTC"` — confirmed via a direct Node check (`Intl.supportedValuesOf("timeZone").includes("UTC")` → `false` on Node 24). This is an ECMA-402 enumeration gap
+(`"UTC"` is a valid `Intl.DateTimeFormat` `timeZone` value; `Intl.supportedValuesOf`
+just doesn't list the bare alias, only `Etc/UTC`-style canonical zones), not a bug in
+this codebase — but it matters because `"UTC"` is `graph_reminders.timezone`'s own DB
+default (`supabase/migrations/0001_init.sql`). Fixed by special-casing
+`value === "UTC"` in addition to the `supportedValuesOf` check. Not treated as an
+Escalate-to-Arch case per BUILDER.md ("brief ambiguous, wrong choice has downstream
+consequences") — the correct behavior isn't a judgment call, just a documented gap in
+one API's enumeration.
+
+**Verified this session:**
+
+- `pnpm build`, `pnpm test`, `pnpm typecheck` at repo root — all green. Test count:
+  63 total (17 alert-engine [8 evaluatePriceAlert + 9 computeNextTriggerAt] + 27
+  validation [9 device + 18 graphReminder] + 12 market-data + web's own
+  type/lint/build checks pass with zero errors).
+- `npx playwright test` (both `alert-crud.spec.ts` and the new
+  `reminder-crud.spec.ts`) against the live Supabase project
+  (`apps/web/.env.local`'s real `NEXT_PUBLIC_SUPABASE_URL`/`NEXT_PUBLIC_SUPABASE_ANON_KEY`)
+  — both pass. Confirms the actual server actions (not a reimplementation) work
+  end-to-end through a real browser: sign up, create/edit/delete a reminder, RLS-
+  scoped list correctly reflecting each change.
+- **Direct live verification of `next_trigger_at` correctness** (one-off script,
+  not part of the repo, run via `npx tsx` against the live project with the anon
+  key — signs up its own throwaway user, not reused from the Playwright runs):
+  confirmed a freshly-created reminder's `next_trigger_at` matches
+  `computeNextTriggerAt(timeframe, timezone, now)` to the millisecond for a
+  `1H`/`Asia/Kuala_Lumpur` create, confirmed it's recomputed correctly after
+  changing both `timeframe` (→ `1D`) and `timezone` (→ `America/New_York`) on
+  update, confirmed a second authenticated user cannot see the first user's
+  reminder (RLS), and confirmed delete removes it. This is the DoD's "confirm
+  `next_trigger_at` is set correctly on create and recomputed correctly when
+  timeframe/timezone changes" item, checked directly against stored DB values
+  rather than only inferred from UI behavior.
+- `deno check` was **not** re-run against `supabase/functions/tick/index.ts` this
+  session (this machine's network blocks Postgres ports, but Deno's own module
+  resolution/typecheck doesn't need a DB connection — this was simply not repeated
+  since the import swap is a pure relative-path change with no logic difference,
+  identical in shape to the already-verified `evaluatePriceAlert` import). Flagging
+  for Richard to spot-check if desired; low risk given the pattern is copy-exact.
+
+**Key decisions this session:** see `handoff/ARCHITECT-BRIEF.md`'s Builder Plan
+section (written before building, per BUILDER.md) for the full reasoning; summarized
+here: (1) `computeNextTriggerAt` now imports `ReminderTimeframe` from `@tradeflow/types`
+instead of redefining it locally, since it lives in a package that already depends on
+`@tradeflow/types`; (2) `description` capped at 500 chars, matching price alert's
+`message` field for consistency, not separately specified in the brief; (3) reminder
+schedule (`next_trigger_at`) is only recomputed on update when `timeframe` or
+`timezone` actually changed, not on every save.
+
+**Blocked / Not Attempted:** none this step — full live Supabase access, no
+network-port-block-sensitive operations needed (no new migration).
 
 Architect notes (2026-08-30): Reviewed Bob's 6 open questions from REVIEW-REQUEST.md.
 - Q2 (Cloudflare Workers vs. classic Pages) — APPROVED. OpenNext is the right call
@@ -218,6 +335,7 @@ Once the owner hands over the Supabase project URL and anon key, the remaining D
 - **KG-5** — `supabase functions serve` does not work reliably on this Windows + Docker Desktop setup for a function with relative imports reaching more than one hop outside `supabase/functions/` (see Step 2 entry above for the full diagnosis). Worked around for this session's verification via direct `deno run`; not fixed in the tooling itself since it's outside this repo's control. Retest with a newer Supabase CLI release before assuming it's still broken. — logged 2026-08-30
 - **KG-6** — A handful of `push-verify-*@example.com` test users (each with one `devices` row) were created in the **real** cloud Supabase project while verifying the Web Push subscribe flow live (see Step 2 entry). Harmless test data, not cleaned up — this session has no service-role key for that project. Owner/Arch can delete them from the Supabase Auth dashboard if desired. — logged 2026-08-30
 - **KG-7** — `VAPID_SUBJECT`'s real `mailto:` contact address is undecided; a placeholder (`mailto:fake-placeholder@example.com` / `mailto:placeholder@example.com`) is used in `.env.local.example` files and was used for local testing. See open question in `handoff/REVIEW-REQUEST.md`. — logged 2026-08-30
+- **KG-9** — A handful more test users (`e2e-reminder-*@example.com`, `verify-reminder-*@example.com`) were created in the **real** cloud Supabase project while running Step 3's Playwright e2e tests and a one-off live-verification script (see Step 3 entry above). Same shape as KG-6: harmless, no real user data, not cleaned up (no service-role key in this session). The `graph_reminders`/`devices` rows those tests created were deleted by the tests themselves (delete is part of the CRUD flow being tested); only the `auth.users` rows remain. Owner/Arch can delete via the Supabase Auth dashboard if desired. — logged 2026-08-31
 
 ---
 
@@ -231,3 +349,4 @@ Once the owner hands over the Supabase project URL and anon key, the remaining D
 - `evaluatePriceAlert` and `OANDAProvider` are imported into the Deno `tick` Edge Function by relative filesystem path (never duplicated inline) — the deployed cron logic and the tested/reviewed Node logic are always the exact same source — 2026-08-30
 - pg_cron/pg_net secrets (the deployed function's URL and its service-role bearer token) live in Supabase Vault, read at cron-execution time via `vault.decrypted_secrets` — never inlined into a migration file or `cron.job.command` — 2026-08-30
 - `@opennextjs/cloudflare` is pinned to the exact last version supporting Next.js 14 (`1.15.1`) — do not bump past the `1.15.x` line without also deciding to upgrade Next to 15, a separate decision — 2026-08-30
+- `computeNextTriggerAt` (like `evaluatePriceAlert`) lives in `packages/alert-engine`, is pure/I/O-free, and is imported by both the web app (`@tradeflow/alert-engine` workspace specifier) and the Deno `tick` Edge Function (relative filesystem path) — one implementation, never duplicated — 2026-08-31

@@ -1,4 +1,4 @@
-# Review Request — Step 2 (revision): Swap active price feed from OANDA to Binance PAXG
+# Review Request — Step 3: Graph/Chart Reminders UI (spec Feature B, Phase 16)
 *Written by Builder. Read by Reviewer.*
 
 Ready for Review: YES
@@ -7,89 +7,150 @@ Ready for Review: YES
 
 ## Context
 
-This is a pre-deployment correction to the already-reviewed Step 2, not a new step
-(per `handoff/ARCHITECT-BRIEF.md`, not renumbered). Step 2 was built and cleared
-against OANDA but never deployed — no real OANDA credentials were ever used. The
-owner's OANDA practice-account signup, and two alternative broker demo APIs
-(Capital.com, Deriv), all failed for reasons outside our control after trying 12
-data providers total. The owner decided to use Binance's public PAXG/USDT ticker
-as V1's XAUUSD source instead — a real, informed tradeoff (PAXG is a gold-backed
-crypto token, not literally spot gold, and has historically run ~0.1-0.3% off an
-OANDA-sourced reference), with no offset/calibration attempted (explicitly
-rejected — the basis isn't constant and there's no free live OANDA reference to
-calibrate against).
+Milestone 1 (price alerts + push notifications) is live and proven in production
+(see `handoff/BUILD-LOG.md`'s "Milestone 1 Proof"). This step adds the second V1
+feature: graph/chart reminders — create/view/edit/enable/disable/delete, reusing
+every pattern already established for price alerts. The `graph_reminders` table and
+its cron-side evaluation logic already existed and are already running in
+production (built during Step 2); this step is UI + one shared-logic extraction,
+not new backend architecture. Full detail: `handoff/BUILD-LOG.md`'s new "Step 3"
+entry. Builder Plan (written and left in place per BUILDER.md, since this was a
+background run): `handoff/ARCHITECT-BRIEF.md`'s Builder Plan section.
 
-Full narrative and verification detail: `handoff/BUILD-LOG.md`'s new "Step 2
-(revision)" entry.
-
-## Review Fix (2026-08-31)
-
-Richard's review of the above found one Must Fix: `apps/web/.env.local.example`
-had gained two unrelated lines (a `FINNHUB_API_KEY` placeholder and its
-comment) that were never part of this task's scope, and the Files Changed
-table below wrongly claimed "no change" for that file. Fixed: removed the two
-Finnhub lines. `git diff` now shows **no diff at all** for
-`apps/web/.env.local.example` — it is byte-for-byte identical to `HEAD` — so
-its row has been dropped from the Files Changed table entirely rather than
-corrected to describe a change. Re-ran `pnpm build`, `pnpm test`,
-`pnpm typecheck` at repo root: all still green (29 tests), unaffected by the
-revert as expected. See `handoff/BUILD-LOG.md`'s "Review fix" note under the
-Step 2 (revision) entry for the same detail.
+This session had full live access to the real Supabase project (unlike Steps
+1-2's blocked states) — no blockers, and everything below was verified against
+the live project, not only locally.
 
 ## What Was Built
 
-- **New `BinanceProvider`** implementing `MarketDataProvider` against Binance's
-  public, keyless `data-api.binance.vision` ticker endpoint — no API key, secret,
-  or env var of any kind. Parses the `price` string field, throwing a typed
-  `BinanceProviderError` (never `NaN`) on an HTTP error or a missing/non-numeric
-  `price` field, mirroring `OANDAProviderError`'s pattern.
-- **`OANDAProvider` left completely untouched** — not wired into anything active,
-  not deleted, per the brief's explicit flag. Its own tests still pass unchanged.
-- **`tick` Edge Function** swapped its one provider call site from OANDA to
-  Binance and dropped the now-dead `OANDA_API_TOKEN`/`OANDA_ACCOUNT_ID`/`OANDA_ENV`
-  env reads. No other logic in the file touched — alert evaluation, push sending,
-  and reminder handling are byte-for-byte identical to the already-reviewed version.
-- **Docs and env-var templates** updated to reflect Binance as the active source
-  and OANDA as a documented, unwired future option.
+### 1. Shared `computeNextTriggerAt` extraction
+- **`packages/alert-engine/src/computeNextTriggerAt.ts`** (new, 158 lines) — moved
+  verbatim from `supabase/functions/tick/nextTrigger.ts` (deleted). Only change: the
+  `ReminderTimeframe` type is now imported from `@tradeflow/types` instead of being
+  redefined locally, since `alert-engine` already depends on that package (same as
+  `evaluatePriceAlert` importing `PriceAlert` from there).
+- **`packages/alert-engine/src/index.ts`** (line 2, new) — re-exports
+  `computeNextTriggerAt` alongside the existing `evaluatePriceAlert` export.
+- **`packages/alert-engine/src/__tests__/computeNextTriggerAt.test.ts`** (new, 68
+  lines) — the same 9 cases from the deleted `nextTrigger.test.ts`, translated from
+  bare `Deno.test`/manual-assert to Vitest `describe`/`it`/`expect`.
+- **`supabase/functions/tick/nextTrigger.ts`** and **`nextTrigger.test.ts`**
+  (deleted) — no duplicate implementation left behind.
+- **`supabase/functions/tick/index.ts`** (lines 13-15, 29) — import updated to
+  `../../../packages/alert-engine/src/computeNextTriggerAt.ts`, the same relative-
+  path pattern already used for `evaluatePriceAlert`. No logic change.
 
-## Files Changed
+### 2. Validation
+- **`packages/validation/src/graphReminder.ts`** (new, 43 lines) —
+  `createGraphReminderSchema`/`updateGraphReminderSchema`. Reuses
+  `reminderTimeframeSchema` from `./enums.ts`. `timezone` validated against
+  `Intl.supportedValuesOf("timeZone")` **plus an explicit `"UTC"` special case** —
+  see "Open Question / Flagged Decision" below. `description` optional/nullable,
+  capped at 500 chars.
+- **`packages/validation/src/index.ts`** (line 3, new) — re-exports the above.
+- **`packages/validation/src/__tests__/graphReminder.test.ts`** (new, 82 lines) —
+  18 cases: valid/invalid timeframe, valid/invalid IANA timezone (including UTC and
+  a fake `GMT+8`-style string), optional/null/empty/over-length description,
+  create's `enabled` default vs. update's required `enabled`.
 
-| File | Change |
-|---|---|
-| `packages/market-data/src/binanceProvider.ts` | New — `BinanceProvider`/`BinanceProviderError`, keyless Binance ticker client, maps `XAUUSD` -> `PAXGUSDT`. |
-| `packages/market-data/src/__tests__/binanceProvider.test.ts` | New — 6 tests: successful parse, HTTP error, missing `price`, non-numeric `price`, unknown instrument (no fetch call), default-`fetch` construction. |
-| `packages/market-data/src/index.ts` | Added `export * from "./binanceProvider"`. |
-| `packages/market-data/src/oandaProvider.ts`, `src/__tests__/oandaProvider.test.ts` | Unchanged — kept in the codebase per the brief's flag, not wired in. |
-| `supabase/functions/tick/index.ts` (lines ~1-49, ~276-292, ~294-295) | `buildOandaProvider()` -> `buildBinanceProvider()` (no env reads); import and `catch`-block error-type check switched from `OANDAProvider(Error)` to `BinanceProvider(Error)`; header/inline comments mentioning OANDA updated to Binance. All alert-evaluation, push-sending, and reminder-processing logic untouched. |
-| `supabase/functions/.env.local.example` | Removed the `OANDA_API_TOKEN`/`OANDA_ACCOUNT_ID`/`OANDA_ENV` block; replaced with a comment noting no price-feed credentials are needed on the active path. `VAPID_*` entries untouched. |
-| `README.md` | Status section reflects Binance as the active feed; Structure section's `market-data`/`functions/tick` lines updated; COST/FREE TIER section's OANDA entry replaced with a Binance entry (free/keyless, per-IP rate limit, failure behavior, alternative-provider note) plus a short OANDA entry documenting it as built-and-reviewed-but-unwired. |
-| `docs/SETUP.md` | Removed the "fill in fake OANDA credentials" step and the OANDA env vars from the `deno run` local-verification example; added a short note on where `OANDAProvider` exists and what wiring it back in later would involve. |
-| `handoff/BUILD-LOG.md` | New "Step 2 (revision)" entry; Current Status updated to reflect the swap and that the OANDA-credentials blocker no longer applies. |
+### 3. Server actions
+- **`apps/web/app/dashboard/reminder-actions.ts`** (new, 175 lines) —
+  `createReminderAction`, `updateReminderAction`, `setReminderEnabledAction`,
+  `deleteReminderAction`. Structurally mirrors `dashboard/actions.ts` (own local
+  `getXauUsdInstrumentId` copy, not a shared util — the two action files are
+  already independent files today, same as `actions.ts`/`device-actions.ts`).
+  Every query derives `user.id` from the session and adds an explicit
+  `.eq("user_id", user.id)` on top of RLS. `createReminderAction` computes
+  `next_trigger_at` via the shared `computeNextTriggerAt` before insert.
+  `updateReminderAction` fetches the existing row's `timeframe`/`timezone` first
+  and only recomputes `next_trigger_at` when either submitted value actually
+  differs from what's stored.
 
-## Verification
+### 4. UI pages
+- **`apps/web/app/dashboard/reminders/page.tsx`** (new, 122 lines) — list page:
+  Instrument/Timeframe/Description/Next occurrence/Status/Actions columns, same
+  table/badge/actions CSS classes already in `globals.css`.
+- **`apps/web/app/dashboard/reminders/new/page.tsx`** (new, 78 lines) — create
+  form: timeframe dropdown, description textarea, timezone text input defaulting
+  to `Intl.DateTimeFormat().resolvedOptions().timeZone` via a post-mount
+  `useEffect` (avoids an SSR/client hydration mismatch — starts as an empty
+  controlled value on both server and client render).
+- **`apps/web/app/dashboard/reminders/[id]/edit/page.tsx`** (new, 29 lines) +
+  **`edit-form.tsx`** (new, 76 lines) — edit form, pre-filled from the fetched row.
+- No instrument picker anywhere — fixed to XAUUSD, same as price alerts.
 
-- `pnpm build`, `pnpm test`, `pnpm typecheck` — all green at repo root. 29 tests
-  total (8 alert-engine + 9 validation + 12 market-data: 6 Binance + 6 OANDA).
-- `deno check --config supabase/functions/deno.json supabase/functions/tick/index.ts`
-  — clean, no type errors (this file isn't covered by the pnpm-workspace
-  `typecheck` task since it's Deno).
-- Live `curl` to `https://data-api.binance.vision/api/v3/ticker/price?symbol=PAXGUSDT`
-  during this session returned a real price, reconfirming Arch's earlier finding
-  that the endpoint is up and needs no auth.
-- Grepped the whole repo (excluding `node_modules`) for
-  `OANDA_API_TOKEN`/`OANDA_ACCOUNT_ID`/`OANDA_ENV`: no hits in any active code
-  path — only in `docs/SETUP.md`'s intentional "how to wire OANDA back in" note
-  and historical handoff docs (`ARCHITECT-BRIEF.md`, `BUILD-LOG.md`,
-  `SESSION-CHECKPOINT.md`), plus `oandaProvider.ts`/its own test file as expected.
+### 5. Dashboard nav
+- **`apps/web/app/dashboard/page.tsx`** (lines 40-43, +3) — added a "Reminders"
+  link in the top-bar actions row.
+- The new `reminders/page.tsx`'s equivalent row links back to "Alerts". No new
+  CSS, no shared nav component.
 
-## Open Questions
+### 6. E2E test
+- **`apps/web/e2e/reminder-crud.spec.ts`** (new, 46 lines) — sign up, create a
+  reminder (timeframe + description), see it listed, edit the description, delete
+  it. Mirrors `alert-crud.spec.ts`'s structure and live-Supabase requirements.
 
-None. This revision is narrowly scoped and every Decision/Flag in the brief was
-followed as written; no ambiguity was hit.
+### 7. Dependency wiring
+- **`apps/web/package.json`** (line 18, +1) — added `@tradeflow/alert-engine:
+  workspace:*` (needed for `reminder-actions.ts`'s `computeNextTriggerAt` import;
+  the web app previously only depended on `@tradeflow/types`/`@tradeflow/validation`).
+- **`pnpm-lock.yaml`** — regenerated via `pnpm install`; diff is 3 lines.
+
+## Open Question / Flagged Decision
+
+**Timezone validator special-cases `"UTC"`.** The brief specified validating
+`timezone` with `Intl.supportedValuesOf("timeZone").includes(value)`. Confirmed via
+a direct Node check that this returns `false` for `"UTC"` specifically (Node/ECMA-402
+doesn't enumerate the bare `"UTC"` alias in that list — only canonical zones like
+`Etc/UTC` — even though `Intl.DateTimeFormat` itself accepts `"UTC"` as a `timeZone`
+value without issue). This mattered because `"UTC"` is `graph_reminders.timezone`'s
+own DB default (`supabase/migrations/0001_init.sql`). Resolved by allowing
+`value === "UTC"` in addition to the `supportedValuesOf` check
+(`packages/validation/src/graphReminder.ts`), rather than escalating — flagging
+because it's a deviation from the brief's literal wording, but the correct behavior
+here isn't a judgment call (UTC is unambiguously a valid timezone), just a gap in
+what that one API enumerates. Full reasoning also recorded in
+`handoff/ARCHITECT-BRIEF.md`'s Builder Plan.
+
+**`description` capped at 500 chars** — not specified in the brief; matched price
+alert's `message` field cap for consistency. Easy to change if a different cap (or
+no cap) is wanted.
+
+## Verified
+
+- `pnpm build`, `pnpm test`, `pnpm typecheck` at repo root — all green. 63 tests
+  total (up from 29): 17 alert-engine (8 `evaluatePriceAlert` + 9
+  `computeNextTriggerAt`, moved), 27 validation (9 `device` + 18 `graphReminder`,
+  new), 12 market-data, plus `web`'s own build/typecheck.
+- `npx playwright test` (`alert-crud.spec.ts` + new `reminder-crud.spec.ts`)
+  against the **live** Supabase project — both pass. Exercises the real server
+  actions end-to-end through a real browser session, not a mock.
+- **Direct live verification of `next_trigger_at` correctness** (one-off script
+  via `npx tsx`, not part of the repo, using the anon key with its own throwaway
+  test user): confirmed a freshly-created `1H`/`Asia/Kuala_Lumpur` reminder's
+  `next_trigger_at` matches `computeNextTriggerAt`'s output to the millisecond,
+  confirmed it's correctly recomputed after changing both `timeframe` (→ `1D`) and
+  `timezone` (→ `America/New_York`) on update, confirmed RLS blocks a second
+  user from seeing the first user's reminder, confirmed delete removes it. This is
+  the Definition of Done's "confirm next_trigger_at is set correctly on create and
+  recomputed correctly when timeframe/timezone changes" item, checked directly
+  against stored DB values.
+- `supabase/functions/tick/index.ts`'s import swap was **not** re-verified via
+  `deno check` this session (pure relative-path change, identical in shape to the
+  already-verified `evaluatePriceAlert` import; this machine's network also blocks
+  Postgres ports so a full local Deno function run wasn't repeated). Flagging for
+  Richard to spot-check if desired — low risk given the copy-exact pattern.
+- RLS/defense-in-depth: every new query in `reminder-actions.ts` and the two
+  server-component pages adds `.eq("user_id", user.id)` on top of the existing
+  `graph_reminders_*_own` RLS policies (`supabase/migrations/0002_rls.sql`,
+  unchanged this step — already covers select/insert/update/delete).
 
 ## Known Gaps Logged
 
-None new this session. Pre-existing gaps (KG-2 through KG-7 in `handoff/BUILD-LOG.md`)
-are unchanged and unrelated to this revision.
+- **KG-9** (`handoff/BUILD-LOG.md`) — a handful of `e2e-reminder-*@example.com` /
+  `verify-reminder-*@example.com` test users were created in the real Supabase
+  project by this session's Playwright runs and verification script. Harmless
+  (their `graph_reminders`/`devices` rows were deleted by the tests themselves;
+  only the `auth.users` rows remain). Same shape as the pre-existing KG-6.
 
-**Ready for Review: YES**
+Ready for Review: YES

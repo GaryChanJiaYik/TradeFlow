@@ -10,9 +10,9 @@
 // context and RLS is bypassed by design here (see
 // handoff/ARCHITECT-BRIEF.md Step 2 Decisions).
 //
-// evaluatePriceAlert and BinanceProvider are imported via a *relative
-// filesystem path* into the TS source of packages/alert-engine and
-// packages/market-data, not the @tradeflow/* workspace specifiers — Deno
+// evaluatePriceAlert, computeNextTriggerAt, and BinanceProvider are imported
+// via a *relative filesystem path* into the TS source of packages/alert-engine
+// and packages/market-data, not the @tradeflow/* workspace specifiers — Deno
 // executes TypeScript directly and doesn't need node_modules resolution
 // for relative imports, so no esbuild/bundling step is needed. This keeps
 // the tested, reviewed logic as the single source of truth instead of
@@ -26,7 +26,7 @@ import {
   type EvaluableAlert,
 } from "../../../packages/alert-engine/src/evaluatePriceAlert.ts";
 import { BinanceProvider, BinanceProviderError } from "../../../packages/market-data/src/binanceProvider.ts";
-import { computeNextTriggerAt } from "./nextTrigger.ts";
+import { computeNextTriggerAt } from "../../../packages/alert-engine/src/computeNextTriggerAt.ts";
 
 const XAUUSD_SYMBOL = "XAUUSD";
 

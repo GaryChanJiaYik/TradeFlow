@@ -11,9 +11,16 @@
  * hour, 4H -> 00/04/08/12/16/20, 1D -> local midnight) — matching when a
  * chart candle of that timeframe closes — rather than "N minutes from
  * whenever the reminder was created."
+ *
+ * Shared by both the web app (server actions, computing the initial/updated
+ * `next_trigger_at` at write time) and the `tick` Edge Function (recomputing
+ * it after each fire) — see handoff/ARCHITECT-BRIEF.md Step 3 Decisions for
+ * why this moved here from supabase/functions/tick/nextTrigger.ts (Deno-only
+ * originally): one implementation, imported by both environments via
+ * relative path, same pattern already used for `evaluatePriceAlert`.
  */
 
-export type ReminderTimeframe = "15m" | "1H" | "4H" | "1D";
+import type { ReminderTimeframe } from "@tradeflow/types";
 
 const TIMEFRAME_MINUTES: Record<Exclude<ReminderTimeframe, "1D">, number> = {
   "15m": 15,

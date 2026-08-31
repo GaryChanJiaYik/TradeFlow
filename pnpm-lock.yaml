@@ -23,6 +23,9 @@ importers:
       '@supabase/supabase-js':
         specifier: ^2.45.4
         version: 2.112.4
+      '@tradeflow/alert-engine':
+        specifier: workspace:*
+        version: link:../../packages/alert-engine
       '@tradeflow/types':
         specifier: workspace:*
         version: link:../../packages/types
