@@ -5,9 +5,9 @@
 
 ## Current Status
 
-**Active step:** Step 4 — Fix: unauthenticated access to "new alert"/"new reminder" pages — Status: code-complete, live-verified against the real Supabase project, awaiting review. See "Step 4" entry below.
-**Last cleared:** Step 2 revision — 2026-08-31, Richard's round-2 re-review (stray FINNHUB_API_KEY placeholder caught and reverted; swap otherwise clean). Milestone 1 (see "Milestone 1 Proof" below) is proven and live in production.
-**Pending deploy:** Milestone 1 (Steps 1-2) LIVE as of 2026-08-31. Step 3 and Step 4 are built and verified locally/against the live Supabase project but **not yet deployed to Cloudflare** — per Arch's dispatch note, Arch handles the redeploy after review clears. This means the live deployment currently still has the Step 4 vulnerability (unauthenticated visitors can view, but not submit, the two create-form pages) until Arch redeploys. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix). Step 3 and Step 4 not yet committed — see this session's uncommitted working tree.
+**Active step:** Step 4 (auth fix) CLEAR, committed, and deployed. Steps 3 and 4 are both live in production. Milestone 1 remains proven — see "Milestone 1 Proof" below.
+**Last cleared:** Step 4 — 2026-08-31, Richard's review (independently reproduced every claim: read both guards for a fall-through path, diffed extracted forms against git history, re-ran the grep audit himself, own local build + curl verification).
+**Pending deploy:** LIVE as of 2026-08-31. Confirmed via production curl: `/dashboard/alerts/new` and `/dashboard/reminders/new` now correctly return 307 -> `/login` for unauthenticated requests, with no form content in the body (verified — an earlier grep hit on "Direction" was a false positive from `flexDirection` in an embedded style, not the form). Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix), 2c253d8 (Step 3), 0f21a9e (Step 4).
 
 ### Milestone 1 Proof — 2026-08-31
 
