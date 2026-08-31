@@ -5,9 +5,9 @@
 
 ## Current Status
 
-**Active step:** Step 2 (revision) — active price feed swapped from OANDA to Binance PAXG/USDT, code-complete, locally verified, awaiting review. Still blocked on: supabase functions deploy, pg_cron/pg_net enablement on the live project, actual Cloudflare deploy — all owner/Arch-side, no further code changes needed once unblocked. The real-OANDA-credentials blocker from the prior Step 2 entry no longer applies — Binance's public endpoint needs no credentials at all.
-**Last cleared:** Step 2 — 2026-08-30, Richard's round-2 re-review (SSRF fix confirmed with no bypass). The Step 2 revision below (OANDA -> Binance swap) is new since that clearance and awaits its own review.
-**Pending deploy:** N/A — no deploy target confirmed live yet. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd (Step 2).
+**Active step:** Step 2 (revision) — CLEAR. Active price feed is Binance PAXG/USDT, no credentials needed. Still blocked on: supabase functions deploy, pg_cron/pg_net enablement on the live project, actual Cloudflare deploy — all owner/Arch-side, no further code changes needed once unblocked.
+**Last cleared:** Step 2 revision — 2026-08-31, Richard's round-2 re-review (stray FINNHUB_API_KEY placeholder caught and reverted; swap otherwise clean).
+**Pending deploy:** N/A — no deploy target confirmed live yet. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97 (Step 2 revision).
 
 ---
 
