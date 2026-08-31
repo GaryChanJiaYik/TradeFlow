@@ -5,9 +5,23 @@
 
 ## Current Status
 
-**Active step:** Step 2 (revision) — CLEAR. Active price feed is Binance PAXG/USDT, no credentials needed. Still blocked on: supabase functions deploy, pg_cron/pg_net enablement on the live project, actual Cloudflare deploy — all owner/Arch-side, no further code changes needed once unblocked.
+**Active step:** DEPLOYED. `tick` Edge Function deployed and scheduled via pg_cron (every 2 min); web app live on Cloudflare Workers at https://tradeflow-web.garychanjiayik.workers.dev. Remaining before Milestone 1 is proven: push code to GitHub (owner setting up remote), then the actual laptop-off proof.
 **Last cleared:** Step 2 revision — 2026-08-31, Richard's round-2 re-review (stray FINNHUB_API_KEY placeholder caught and reverted; swap otherwise clean).
-**Pending deploy:** N/A — no deploy target confirmed live yet. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97 (Step 2 revision).
+**Pending deploy:** LIVE as of 2026-08-31. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix).
+
+### Deployment — 2026-08-31
+
+**Supabase (live project `pepizbjtpclypgfzkole`):**
+- `tick` Edge Function deployed via `supabase functions deploy` (HTTPS-based Management API — worked fine).
+- VAPID secrets set via `supabase secrets set`. `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` are auto-injected by Supabase for every deployed function — not set manually.
+- `pg_cron`/`pg_net` extensions and the two Vault secrets (`tick_function_url`, `tick_function_service_role_key`) were applied via the dashboard **SQL Editor** by the owner, not `supabase db push` — direct Postgres connections (ports 5432/6543) are blocked on the owner's network (confirmed via raw TCP tests; HTTPS/443 works fine), so the CLI's direct-DB-connection commands (`db push`, `migration list`) cannot run from this machine. `cron.schedule` returned job id `1` — the schedule is registered and firing every 2 minutes.
+- **Known gap (KG-8):** `0001_init.sql`/`0002_rls.sql` were applied earlier (Step 1, before this network restriction was identified) and `0003_cron.sql`'s DDL was hand-run via SQL Editor — but the migration files themselves were never applied via `supabase db push`, so the CLI's migration-history table doesn't know about them. Future migrations will need the same manual SQL Editor approach, or running `db push` from a network without the port block, until/unless this is resolved.
+
+**Cloudflare (Workers, via `@opennextjs/cloudflare`):**
+- Account had no `workers.dev` subdomain registered yet — resolved by the owner via the dashboard (`garychanjiayik.workers.dev`), not something the CLI or API could do non-interactively (a direct API attempt using wrangler's stored OAuth token returned an auth error — that token isn't usable for direct Cloudflare API v4 calls the way an API token would be).
+- First deploy attempt failed on Windows with `EPERM: symlink` during Next.js's standalone-output file tracing — fixed by the owner enabling Windows Developer Mode (grants regular users symlink-creation rights).
+- Second deploy attempt succeeded but every route 500'd: `Dynamic require of "/.next/server/middleware-manifest.json" is not supported`. Confirmed via `wrangler tail` live logs, then confirmed via web research as a known `@opennextjs/cloudflare` + pnpm issue (Next's middleware-manifest loader falls back to a dynamic `require()` that the Workers ESM runtime can't execute). Fixed with `shamefully-hoist=true` + `node-linker=hoisted` in a new root `.npmrc` (the documented workaround for this specific pnpm-related bug), which required a full `node_modules` wipe across every workspace package (a partial root-only reinstall left stale symlinks and broke `next`'s own binary resolution — caught and fixed with a full clean before it reached production). Third deploy: all routes return 200, confirmed via curl.
+- Live at: https://tradeflow-web.garychanjiayik.workers.dev
 
 ---
 
