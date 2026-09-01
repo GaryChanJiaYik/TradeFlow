@@ -83,3 +83,81 @@ describe("updateGraphReminderSchema", () => {
     expect(result.success).toBe(true);
   });
 });
+
+describe("market-open/close window fields (Step 5)", () => {
+  it("accepts both fields omitted, normalizing to explicit null/null", () => {
+    const result = createGraphReminderSchema.safeParse(baseInput());
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.window_start_time).toBeNull();
+      expect(result.data.window_end_time).toBeNull();
+    }
+  });
+
+  it("accepts both fields explicitly null", () => {
+    const result = createGraphReminderSchema.safeParse(
+      baseInput({ window_start_time: null, window_end_time: null }),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts both fields set to valid, distinct HH:MM times", () => {
+    const result = createGraphReminderSchema.safeParse(
+      baseInput({ window_start_time: "06:00", window_end_time: "22:00" }),
+    );
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.window_start_time).toBe("06:00");
+      expect(result.data.window_end_time).toBe("22:00");
+    }
+  });
+
+  it("accepts an overnight-wrapping window (start later than end)", () => {
+    const result = createGraphReminderSchema.safeParse(
+      baseInput({ window_start_time: "22:00", window_end_time: "06:00" }),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects window_start_time set without window_end_time", () => {
+    const result = createGraphReminderSchema.safeParse(baseInput({ window_start_time: "06:00" }));
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects window_end_time set without window_start_time", () => {
+    const result = createGraphReminderSchema.safeParse(baseInput({ window_end_time: "22:00" }));
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a malformed time string", () => {
+    const result = createGraphReminderSchema.safeParse(
+      baseInput({ window_start_time: "6:00", window_end_time: "22:00" }),
+    );
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects an out-of-range time string", () => {
+    const result = createGraphReminderSchema.safeParse(
+      baseInput({ window_start_time: "25:00", window_end_time: "22:00" }),
+    );
+    expect(result.success).toBe(false);
+  });
+
+  it("normalizes equal start/end times to null/null — 'no restriction', per the owner's own framing", () => {
+    const result = createGraphReminderSchema.safeParse(
+      baseInput({ window_start_time: "06:00", window_end_time: "06:00" }),
+    );
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.window_start_time).toBeNull();
+      expect(result.data.window_end_time).toBeNull();
+    }
+  });
+
+  it("updateGraphReminderSchema enforces the same both-or-neither rule", () => {
+    const result = updateGraphReminderSchema.safeParse(
+      baseInput({ enabled: true, window_start_time: "06:00" }),
+    );
+    expect(result.success).toBe(false);
+  });
+});

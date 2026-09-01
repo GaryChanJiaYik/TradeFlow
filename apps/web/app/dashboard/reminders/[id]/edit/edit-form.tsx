@@ -20,6 +20,11 @@ export function EditReminderForm({ reminder }: { reminder: GraphReminder }) {
   const boundAction = updateReminderAction.bind(null, reminder.id);
   const [state, formAction] = useFormState(boundAction, initialState);
 
+  // DB `time` columns round-trip as "HH:MM:SS"; `<input type="time">`
+  // requires "HH:MM" — slice off the seconds for the default value.
+  const windowStartDefault = reminder.window_start_time?.slice(0, 5) ?? "";
+  const windowEndDefault = reminder.window_end_time?.slice(0, 5) ?? "";
+
   return (
     <div className="card">
       <h1>Edit reminder</h1>
@@ -57,6 +62,30 @@ export function EditReminderForm({ reminder }: { reminder: GraphReminder }) {
             required
           />
         </div>
+
+        <div className="field">
+          <label htmlFor="window_start_time">Market open (optional)</label>
+          <input
+            id="window_start_time"
+            name="window_start_time"
+            type="time"
+            defaultValue={windowStartDefault}
+          />
+        </div>
+
+        <div className="field">
+          <label htmlFor="window_end_time">Market close (optional)</label>
+          <input
+            id="window_end_time"
+            name="window_end_time"
+            type="time"
+            defaultValue={windowEndDefault}
+          />
+        </div>
+        <p className="muted">
+          When both are set, this reminder only fires within that window each day. Leave both
+          blank for no restriction.
+        </p>
 
         <div className="field">
           <label htmlFor="enabled">

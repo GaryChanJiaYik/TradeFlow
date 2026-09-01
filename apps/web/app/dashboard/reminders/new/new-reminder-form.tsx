@@ -61,6 +61,20 @@ export function NewReminderForm() {
         </div>
 
         <div className="field">
+          <label htmlFor="window_start_time">Market open (optional)</label>
+          <input id="window_start_time" name="window_start_time" type="time" />
+        </div>
+
+        <div className="field">
+          <label htmlFor="window_end_time">Market close (optional)</label>
+          <input id="window_end_time" name="window_end_time" type="time" />
+        </div>
+        <p className="muted">
+          When both are set, this reminder only fires within that window each day. Leave both
+          blank for no restriction.
+        </p>
+
+        <div className="field">
           <label htmlFor="enabled">
             <input id="enabled" name="enabled" type="checkbox" defaultChecked /> Enabled
           </label>

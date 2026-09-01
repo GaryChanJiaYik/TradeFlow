@@ -7,9 +7,24 @@ import { setReminderEnabledAction, deleteReminderAction } from "../reminder-acti
 
 type ReminderRow = GraphReminder & { instruments: { symbol: string; name: string } | null };
 
-function formatDate(value: string | null) {
+/**
+ * Bug fix (Step 5): this Server Component runs on Cloudflare Workers, whose
+ * runtime defaults to UTC — `new Date(value).toLocaleString()` with no
+ * `timeZone` option rendered the raw UTC wall-clock time instead of the
+ * reminder's own scheduled timezone (e.g. a 15m reminder computed for
+ * 2:00pm Malaysia time displayed as "6:00 AM"). The *stored* value was
+ * always correct; only this formatting call was wrong. Passing the
+ * reminder's own `timezone` column (already fetched on this page, just
+ * previously unused for display) fixes it regardless of what timezone the
+ * server runtime defaults to.
+ */
+function formatDate(value: string | null, timeZone: string) {
   if (!value) return "—";
-  return new Date(value).toLocaleString();
+  return new Date(value).toLocaleString(undefined, {
+    timeZone,
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
 }
 
 export default async function RemindersPage() {
@@ -76,7 +91,7 @@ export default async function RemindersPage() {
                   <td>{reminder.instruments?.symbol ?? "XAUUSD"}</td>
                   <td>{reminder.timeframe}</td>
                   <td>{reminder.description || "—"}</td>
-                  <td>{formatDate(reminder.next_trigger_at)}</td>
+                  <td>{formatDate(reminder.next_trigger_at, reminder.timezone)}</td>
                   <td>
                     <span className={`badge ${reminder.enabled ? "badge-on" : "badge-off"}`}>
                       {reminder.enabled ? "Enabled" : "Disabled"}

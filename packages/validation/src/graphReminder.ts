@@ -27,6 +27,58 @@ const timezoneSchema = z.string().refine(isValidIanaTimeZone, {
 });
 
 /**
+ * Market-open/close window fields (Step 5), sourced from HTML `<input
+ * type="time">` elements — `"HH:MM"` strings, no seconds. Optional/nullable
+ * on their own; the both-or-neither requirement and the equal-times
+ * normalization are enforced at the object level below (they need both
+ * fields at once, which a per-field schema can't express).
+ */
+const windowTimeSchema = z
+  .string()
+  .regex(/^([01]\d|2[0-3]):[0-5]\d$/, "must be a valid time (HH:MM)")
+  .optional()
+  .nullable();
+
+/**
+ * Wraps a create/update field shape with the shared window-fields
+ * validation: both `window_start_time`/`window_end_time` set or both
+ * absent (mirrors the DB CHECK constraint in
+ * supabase/migrations/0004_reminder_window.sql — defense in depth, per the
+ * brief, not reliance on the DB alone). If both are present and equal,
+ * normalizes to `null`/`null` before it reaches the database — per the
+ * owner's own framing ("6am to 6am the next day is equivalent to no set"),
+ * this collapses what would otherwise be two different representations of
+ * "no restriction" into one.
+ */
+function withWindowFields<Shape extends z.ZodRawShape>(shape: Shape) {
+  return z
+    .object({
+      ...shape,
+      window_start_time: windowTimeSchema,
+      window_end_time: windowTimeSchema,
+    })
+    .refine(
+      (data) => {
+        const startIsNull = (data.window_start_time ?? null) === null;
+        const endIsNull = (data.window_end_time ?? null) === null;
+        return startIsNull === endIsNull;
+      },
+      {
+        message: "Market open and market close must both be set, or both left empty",
+        path: ["window_end_time"],
+      },
+    )
+    .transform((data) => {
+      const start = data.window_start_time ?? null;
+      const end = data.window_end_time ?? null;
+      if (start !== null && end !== null && start === end) {
+        return { ...data, window_start_time: null, window_end_time: null };
+      }
+      return { ...data, window_start_time: start, window_end_time: end };
+    });
+}
+
+/**
  * `description` mirrors price alert's `message` field: optional free text,
  * capped at 500 chars for consistency (not specified in
  * handoff/ARCHITECT-BRIEF.md — flagged as a Builder default, see Builder
@@ -34,7 +86,7 @@ const timezoneSchema = z.string().refine(isValidIanaTimeZone, {
  * recur on their timeframe by design (spec section 16), not a per-instance
  * choice.
  */
-export const createGraphReminderSchema = z.object({
+export const createGraphReminderSchema = withWindowFields({
   timeframe: reminderTimeframeSchema,
   description: z.string().trim().max(500).optional().nullable(),
   timezone: timezoneSchema,
@@ -48,7 +100,7 @@ export type CreateGraphReminderInput = z.infer<typeof createGraphReminderSchema>
  * edited (unlike price alert's `instrument_id`, which is fixed after
  * creation for a different reason: there's only ever been one instrument).
  */
-export const updateGraphReminderSchema = z.object({
+export const updateGraphReminderSchema = withWindowFields({
   timeframe: reminderTimeframeSchema,
   description: z.string().trim().max(500).optional().nullable(),
   timezone: timezoneSchema,

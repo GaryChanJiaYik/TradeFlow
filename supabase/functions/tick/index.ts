@@ -30,6 +30,41 @@ import { computeNextTriggerAt } from "../../../packages/alert-engine/src/compute
 
 const XAUUSD_SYMBOL = "XAUUSD";
 
+/**
+ * Step 5: `graph_reminders.window_start_time`/`window_end_time` (Postgres
+ * `time` columns, round-tripping as `"HH:MM:SS"` strings) -> the
+ * `computeNextTriggerAt` window arg (minutes-since-midnight). Mirrors
+ * `apps/web/app/dashboard/reminder-actions.ts`'s identical helper — kept
+ * duplicated rather than shared, same call as that file's
+ * `getXauUsdInstrumentId` comment: the web app and this Deno function are
+ * already independent today, and the brief's Step 5 flags ask to keep
+ * `computeNextTriggerAt` itself the shared single source of truth, not
+ * every string-parsing caller around it.
+ *
+ * Without this, a windowed reminder's *first* `next_trigger_at` (computed
+ * by the web app at create/edit time) would respect the window, but every
+ * occurrence after the first fire — recomputed here — would silently
+ * revert to unrestricted/midnight-anchored behavior. Not called out in
+ * handoff/ARCHITECT-BRIEF.md's Step 5 Build Order/Definition of Done;
+ * treated as in-scope anyway since leaving it out would break the feature
+ * within one tick cycle in production. Flagged in handoff/BUILD-LOG.md for
+ * Arch's awareness.
+ */
+function timeStringToMinutes(value: string): number {
+  const [hourStr, minuteStr] = value.split(":");
+  return Number(hourStr) * 60 + Number(minuteStr);
+}
+
+function buildReminderWindowArg(
+  reminder: Pick<GraphReminder, "window_start_time" | "window_end_time">,
+): { startMinutes: number; endMinutes: number } | undefined {
+  if (!reminder.window_start_time || !reminder.window_end_time) return undefined;
+  return {
+    startMinutes: timeStringToMinutes(reminder.window_start_time),
+    endMinutes: timeStringToMinutes(reminder.window_end_time),
+  };
+}
+
 function getRequiredEnv(name: string): string {
   const value = Deno.env.get(name);
   if (!value) throw new Error(`Missing required env var: ${name}`);
@@ -240,7 +275,12 @@ async function processGraphReminders(
       push,
     });
 
-    const nextTriggerAt = computeNextTriggerAt(reminder.timeframe, reminder.timezone, now);
+    const nextTriggerAt = computeNextTriggerAt(
+      reminder.timeframe,
+      reminder.timezone,
+      now,
+      buildReminderWindowArg(reminder),
+    );
     await supabase
       .from("graph_reminders")
       .update({ next_trigger_at: nextTriggerAt.toISOString() })

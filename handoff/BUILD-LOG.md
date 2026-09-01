@@ -5,8 +5,9 @@
 
 ## Current Status
 
-**Active step:** Step 4 (auth fix) CLEAR, committed, and deployed. Steps 3 and 4 are both live in production. Milestone 1 remains proven — see "Milestone 1 Proof" below.
+**Active step:** Step 5 (reminder timezone display fix + market-open/close window) — Richard's 2026-09-01 review returned `Ready for Builder: YES`, no Must Fix, one Should Fix (window-branch DST test coverage gap) — addressed same day, see Step 5 entry below. Re-submitted for review. Steps 3 and 4 remain live in production, unaffected by Step 5's in-progress changes. Milestone 1 remains proven — see "Milestone 1 Proof" below.
 **Last cleared:** Step 4 — 2026-08-31, Richard's review (independently reproduced every claim: read both guards for a fall-through path, diffed extracted forms against git history, re-ran the grep audit himself, own local build + curl verification).
+**Blocked on:** Step 5's migration (`0004_reminder_window.sql`) is written but not applied to the live project (network blocks direct Postgres connections, same as KG-8) — Arch needs to apply it via the Supabase dashboard SQL Editor before Step 5's live verification (Build Order step 6) can happen. See Step 5's BUILD-LOG entry for full detail.
 **Pending deploy:** LIVE as of 2026-08-31. Confirmed via production curl: `/dashboard/alerts/new` and `/dashboard/reminders/new` now correctly return 307 -> `/login` for unauthenticated requests, with no form content in the body (verified — an earlier grep hit on "Direction" was a false positive from `flexDirection` in an embedded style, not the form). Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix), 2c253d8 (Step 3), 0f21a9e (Step 4).
 
 ### Milestone 1 Proof — 2026-08-31
@@ -56,6 +57,181 @@ zero dependency on the owner's laptop, browser, or any running local process.
 ---
 
 ## Step History
+
+### Step 5 — Fix reminder timezone display bug + configurable market-open/close window — Status: code-complete, locally verified (DB layer via a throwaway local `supabase start` stack), Richard's Should Fix addressed, re-submitted for review; migration NOT yet applied to the live project
+*Date: 2026-09-01. Background run per Arch's dispatch. Builder Plan recorded in `handoff/ARCHITECT-BRIEF.md`'s Builder Plan section before building, including two flagged deviations/additions from the brief's literal text (see below) — proceeded rather than blocking on a synchronous approval round-trip, per this session's instructions; both are called out again in `handoff/REVIEW-REQUEST.md` for Arch/Richard to weigh in on.*
+
+**Display bug fix:**
+- `apps/web/app/dashboard/reminders/page.tsx`'s `formatDate` now takes the reminder's own
+  `timezone` and passes it as `toLocaleString`'s `timeZone` option (plus `dateStyle:
+  "medium"`/`timeStyle: "short"`), instead of calling `toLocaleString()` with no timezone
+  option (which rendered the raw UTC wall-clock time, since this Server Component runs on
+  Cloudflare Workers whose runtime defaults to UTC). The *stored* `next_trigger_at` was
+  always correct — only this display formatting was wrong. Exactly as specified in the
+  brief's Decisions.
+
+**`computeNextTriggerAt` window support (`packages/alert-engine/src/computeNextTriggerAt.ts`):**
+- Added an optional 4th parameter, `window?: { startMinutes: number; endMinutes: number }`
+  (plain numbers, no string parsing inside this function — per the brief's Flags, that
+  conversion is the caller's job). The entire pre-existing no-window code path is left
+  byte-for-byte untouched, gated behind `if (window) { ...; return ...; }` before it, so
+  the original 9 tests are an exact, zero-risk regression proof.
+- **Formula re-derivation** (flagged in the Builder Plan, worth restating here): I worked
+  every one of the brief's three worked examples by hand before writing code. The
+  offset formula (`offset = ((m - window.startMinutes) % 1440 + 1440) % 1440`) checks out
+  exactly as the brief states. But the brief's suggested rollover-distance expression
+  (`(windowLength - offset + 1440) % 1440`) does **not** reproduce the brief's own
+  overnight-window example (`from=05:30`, window `22:00-06:00`, `offset=450`): that
+  expression gives `30` (→ `06:00`, the window's own *end* — wrong), while `1440 - offset`
+  gives `990` (→ `22:00`, matching the brief's stated expected answer). Used `1440 -
+  offset` uniformly for both "rolled off the last in-window slot" and "currently outside
+  the window" (they're the same formula) — verified against all three worked examples plus
+  several additional boundary cases (exact window-end instant, well-before-window-opens,
+  well-after-window-closes). See the doc comment above
+  `minutesToNextPeriodicOccurrence` for the full reasoning.
+- **1D-with-window**: implemented as `1440 - offset` against the anchor (`window.startMinutes`
+  instead of `0`) rather than the brief's literal "same 'floor then always +1 day'
+  structure" — the literal version would incorrectly skip *today's* still-upcoming
+  occurrence whenever `startMinutes` is later in the day than `from`'s current time (e.g.
+  anchor `10:00`, `from = 08:00` should give *today* `10:00`, not tomorrow). The formula
+  used reduces algebraically to the existing (untouched) midnight-anchored behavior when
+  `startMinutes = 0`, so the existing 1D regression tests double as an implicit
+  correctness check of the generalization. No worked example was given for this branch in
+  the brief — flagged for Arch's awareness in case a different behavior was actually
+  intended.
+- **Tests** (`packages/alert-engine/src/__tests__/computeNextTriggerAt.test.ts`): all three
+  of the brief's worked examples pass as literal cases with matching expected values,
+  plus: exact-window-end-instant exclusion, well-outside-window, an explicit `undefined`-window
+  no-op check, both no-window regression cases (4H and 1D) re-asserted, three 1D-with-window
+  cases (anchor still ahead, anchor already passed, from exactly at anchor), and one
+  window case in a real IANA timezone (`Asia/Kuala_Lumpur`) to confirm the window logic
+  composes correctly with the existing DST-safe wall-clock conversion rather than replacing
+  it. 23 tests total in this file (was 9), all passing.
+
+**Richard's review (2026-09-01) — Should Fix addressed:** the `Asia/Kuala_Lumpur` window
+test above doesn't observe DST, unlike the pre-existing no-window suite's US DST
+fall-back test — an asymmetry between the window and no-window suites' rigor. Added one
+more test, mirroring the existing no-window DST test exactly (same transition, same
+zone: US DST ends 2026-11-01 02:00 America/New_York, clocks fall back to 01:00) but with
+an overnight `22:00-06:00` window and `1H` step applied. Hand-derived before writing the
+assertion (see the test's own comment for the full derivation): `from =
+2026-11-01T05:00:00Z` is wall-clock `01:00` local (EDT, pre-fallback), 180 minutes into
+the window; the periodic-window arithmetic (pure minutes-of-day, no DST awareness needed
+in that formula) advances 60 minutes to wall-clock `02:00` same calendar day; `02:00`
+Nov 1 is unambiguous post-fallback EST (the repeated hour is `01:00-01:59`, not `02:00`),
+so the final `zonedWallClockToUtc` conversion resolves it to `2026-11-01T07:00:00Z` — the
+exact same target instant as the existing no-window DST test, which is what makes this
+hand-verifiable rather than guessed. Test passes as expected, confirming Richard's
+by-construction reasoning: the window helpers only ever operate on wall-clock
+minutes-of-day already produced by `getWallClock`, and hand off to the same
+`zonedWallClockToUtc` fixed-point conversion the no-window branches use unchanged — there
+is no separate DST-sensitive code path in the window branch, so no bug was found and no
+change to `computeNextTriggerAt.ts` was needed. 24 tests total in this file now (was 23).
+`pnpm build`/`pnpm test`/`pnpm typecheck` re-run clean at repo root after this addition
+(32 alert-engine, 37 validation, 12 market-data, all passing; 8/8 packages typecheck;
+`web` production build green).
+
+**Scope addition beyond the brief's literal text — `supabase/functions/tick/index.ts`:**
+- Flagged in the Builder Plan as an escalation-worthy gap: the brief's Build Order and
+  Definition of Done never mention this file, but `processGraphReminders` there also calls
+  `computeNextTriggerAt` (to recompute `next_trigger_at` after each fire, every 2 minutes,
+  live in production). Left unfixed, a windowed reminder's first occurrence (computed by
+  the web app) would respect the window, but every occurrence after that (recomputed here)
+  would silently revert to unrestricted/midnight-anchored behavior — breaking the feature
+  within one tick cycle. Added `buildReminderWindowArg`/`timeStringToMinutes` helpers
+  (mirroring `reminder-actions.ts`'s equivalent, duplicated rather than shared per the
+  existing per-environment-helper convention already established for
+  `getXauUsdInstrumentId`) and now passes the reminder's window through. Typechecked
+  clean with `deno check index.ts` (Deno 2.9.6) — this file isn't covered by the Node
+  `pnpm typecheck`/`pnpm test` since it's Deno-only.
+
+**Migration (`supabase/migrations/0004_reminder_window.sql`, new, NOT applied to the live
+project):**
+- Adds `window_start_time time null` / `window_end_time time null` to `graph_reminders`,
+  plus a `CHECK ((window_start_time IS NULL) = (window_end_time IS NULL))` constraint.
+  Both nullable, default `NULL` — fully backward compatible, no backfill.
+- **Cannot be applied via `supabase db push`** — this network blocks direct Postgres
+  connections (KG-8, first hit by `0003_cron.sql`). Not attempted. Written for the repo's
+  record only; Arch will apply the DDL via the Supabase dashboard SQL Editor after review
+  clears, same as Step 2.
+- **Verified LOCALLY only**, against a throwaway `supabase start` Docker stack (never the
+  real project, no real project URL/credentials touched): `npx supabase db reset` applied
+  all four migrations (`0001`-`0004`) cleanly in order; `\d public.graph_reminders`
+  confirmed both new nullable `time` columns and the new CHECK constraint exist exactly as
+  written; a direct SQL `INSERT` with only `window_start_time` set correctly raised
+  `violates check constraint "graph_reminders_window_both_or_neither"`; a valid
+  both-fields-set `INSERT` succeeded and round-tripped `06:00:00`/`22:00:00` correctly.
+  Local stack torn down afterward (`npx supabase stop`) — no lingering containers, no
+  files left behind (`git status` confirms only the intended source files changed).
+
+**Validation (`packages/validation/src/graphReminder.ts`):**
+- Added optional `window_start_time`/`window_end_time` (`"HH:MM"` strings) to both
+  `createGraphReminderSchema` and `updateGraphReminderSchema` via a shared
+  `withWindowFields` wrapper (avoids duplicating the both-or-neither/normalization logic
+  across create and update).
+- Zod `.refine()`: both present or both absent (mirrors the DB CHECK constraint —
+  defense in depth, not reliance on the DB alone, per the brief).
+- Zod `.transform()`: equal start/end times normalize to `null`/`null` before reaching the
+  database, per the owner's framing ("6am to 6am the next day is equivalent to no set") —
+  collapses what would otherwise be two valid-looking representations of "no restriction"
+  into one. Also normalizes the omitted-both-fields case to explicit `null`/`null` (rather
+  than leaving `undefined`), for the same "one representation" reasoning.
+- **Tests** (`packages/validation/src/__tests__/graphReminder.test.ts`): both omitted,
+  both explicitly null, both valid and distinct, an overnight-wrapping window, one-of-two
+  set (both directions, rejected), malformed time string, out-of-range time string,
+  equal-times-normalize-to-null, and the same both-or-neither rule on
+  `updateGraphReminderSchema`. 28 tests total in this file (was 9), all passing.
+
+**UI (`reminders/new/new-reminder-form.tsx`, `reminders/[id]/edit/edit-form.tsx`,
+`reminder-actions.ts`):**
+- Two optional `<input type="time">` fields ("Market open" / "Market close") added to
+  both forms, with a short explanatory line. The edit form's defaults slice the DB's
+  `"HH:MM:SS"` down to `"HH:MM"` (what `<input type="time">` requires).
+- `reminder-actions.ts`: `readReminderFormFields` now reads the two window fields
+  (empty string → `null`, same pattern already used for `description`). New
+  `timeStringToMinutes`/`buildWindowArg` helpers convert validated `"HH:MM"` strings to
+  the `computeNextTriggerAt` window arg. The existing `scheduleChanged` recompute guard
+  (create/update actions) is extended to also compare the window fields — DB values
+  (`"HH:MM:SS"`) are normalized to `"HH:MM"` first (`normalizeTimeForCompare`) before
+  comparing, so an edit that doesn't touch the window doesn't spuriously look like a
+  schedule change and trigger an unnecessary recompute.
+
+**`packages/types/src/graphReminder.ts`:** added `window_start_time`/`window_end_time:
+string | null` to the `GraphReminder` interface (DB `time` columns round-trip as
+`"HH:MM:SS"` via PostgREST).
+
+**Verified locally this session:**
+- `pnpm build`, `pnpm test`, `pnpm typecheck` — all green at repo root. Test counts: 31
+  alert-engine (was 8; +23 net across both files, see above), 37 validation (was 9; +28,
+  see above), 12 market-data (unchanged). `web`'s production build compiles, typechecks,
+  and generates all 11 routes.
+- `deno check supabase/functions/tick/index.ts` — clean (Deno 2.9.6), confirming the
+  window-arg wiring there typechecks against the Deno import graph too.
+- Local `supabase start`/`db reset` Docker stack — see migration section above.
+
+**Explicitly NOT verified this session (blocked pending Arch applying the migration —
+per this session's instructions, no live verification against the real project for
+anything needing the new columns):**
+- No live create/edit of a windowed reminder against the real Supabase project — the
+  live `graph_reminders` table does not yet have `window_start_time`/`window_end_time`,
+  so any such attempt would fail with a PostgREST "column does not exist" error. Did not
+  attempt this, and did not run the existing `reminder-crud.spec.ts` e2e spec against the
+  live project either (it doesn't touch the new fields, so it would likely still pass, but
+  running any live write against `apps/web/.env.local`'s real project felt like
+  unnecessary risk while the schema is mid-migration — deferred to step 6 of the brief's
+  Build Order, once Arch confirms the migration is live).
+- The brief's Step 5 "Build Order" step 6 (live verification: create a windowed reminder,
+  confirm `next_trigger_at` matches a hand-computed expectation, confirm the list page
+  displays it correctly) is entirely pending Arch applying `0004_reminder_window.sql`.
+
+**Open questions for Arch** (also see Builder Plan in `handoff/ARCHITECT-BRIEF.md`):
+1. The 1D-with-window formula deviates from the brief's literal "always +1 day" wording
+   (see above) — confirm the corrected behavior (today's occurrence when still ahead,
+   tomorrow's when already passed) is what was actually intended.
+2. The `tick/index.ts` scope addition (not in the brief's Build Order/Definition of Done)
+   — confirm this was the right call rather than something to defer/handle separately.
+
+---
 
 ### Step 4 — Fix: unauthenticated access to "new alert"/"new reminder" pages — Status: code-complete, live-verified, awaiting review
 *Date: 2026-08-31. Background run per Arch's dispatch. Security/authorization fix, not a new feature — see `handoff/ARCHITECT-BRIEF.md`'s Step 4 for full root-cause writeup. Builder Plan recorded in `handoff/ARCHITECT-BRIEF.md`'s Builder Plan section before building.*
@@ -428,6 +604,7 @@ Once the owner hands over the Supabase project URL and anon key, the remaining D
 - **KG-9** — A handful more test users (`e2e-reminder-*@example.com`, `verify-reminder-*@example.com`) were created in the **real** cloud Supabase project while running Step 3's Playwright e2e tests and a one-off live-verification script (see Step 3 entry above). Same shape as KG-6: harmless, no real user data, not cleaned up (no service-role key in this session). The `graph_reminders`/`devices` rows those tests created were deleted by the tests themselves (delete is part of the CRUD flow being tested); only the `auth.users` rows remain. Owner/Arch can delete via the Supabase Auth dashboard if desired. — logged 2026-08-31
 - **KG-10** — Two more test users (`e2e-<timestamp>@example.com`, `e2e-reminder-<timestamp>@example.com`) were created in the **real** cloud Supabase project while re-running the existing Step 3 Playwright specs to verify Step 4's fix. Same shape as KG-6/KG-9: harmless, `price_alerts`/`graph_reminders` rows self-deleted by the specs, only `auth.users` rows remain, no service-role key in this session to clean up. Owner/Arch can delete via the Supabase Auth dashboard. — logged 2026-08-31
 - **KG-11** — Step 4's fix is not yet live on the production Cloudflare deployment (see "Pending deploy" above) — this session had no `wrangler deploy` credentials. Until Arch redeploys, `https://tradeflow-web.garychanjiayik.workers.dev/dashboard/alerts/new` and `/dashboard/reminders/new` remain unauthenticated-accessible in production, same as when Arch's brief found them. Fix is code-complete and verified against a local production build; only the deploy step remains, same constraint as Step 3's UI. — logged 2026-08-31
+- **KG-12** — Step 5's migration (`supabase/migrations/0004_reminder_window.sql`, adding `window_start_time`/`window_end_time` to `graph_reminders`) is written but **not applied** to the live Supabase project — same `supabase db push` network block as KG-8. Verified only against a throwaway local `supabase start`/`db reset` Docker stack (torn down after; no real project touched). Until Arch applies this DDL via the dashboard SQL Editor: (a) the live `graph_reminders` table has no window columns, so creating/editing a reminder with a market-open/close window set would fail with a PostgREST "column does not exist" error against production, and (b) Step 5's Build Order step 6 (live verification of the windowed schedule + display fix) cannot be performed. The display-only bug fix (`reminders/page.tsx`'s `formatDate` timezone fix) does not depend on this migration and could be deployed/verified independently if desired. — logged 2026-09-01
 
 ---
 
