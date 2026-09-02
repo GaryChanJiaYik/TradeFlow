@@ -5,10 +5,14 @@
 
 ## Current Status
 
-**Active step:** Step 5 CLEAR and deployed. Migration `0004_reminder_window.sql` applied live via the Supabase dashboard SQL Editor (2026-09-02), `tick` function and web app both redeployed, owner confirmed via the live UI that the "Next occurrence" display and the market-open/close window both work correctly. Steps 1-5 are all live in production. Milestone 1 remains proven — see "Milestone 1 Proof" below.
-**Last cleared:** Step 5 — 2026-09-01/02, Richard's review (independently re-derived the window arithmetic from scratch, confirmed the no-window path is a true no-op via diff, confirmed the 1D generalization algebraically) plus one Should Fix (DST+window test coverage) closed same cycle.
+**Active step:** Step 6 CLEAR, pending redeploy of the `tick` Edge Function (code committed, not yet pushed to the live Supabase project — Steps 1-5 remain live and unaffected).
+**Last cleared:** Step 6 — 2026-09-02, Richard's review (confirmed no fall-through path from a failed update to a push/log; diffed against commit 925a612 confirming zero business-logic change; assessed the REVOKE-based forced-failure method as legitimate). Two non-blocking Should Fix items logged below (KG-13, KG-14).
 **Blocked on:** nothing currently.
-**Pending deploy:** LIVE as of 2026-09-02. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix), 2c253d8 (Step 3), 0f21a9e (Step 4), 925a612 (Step 5).
+
+### Known Gaps (added from Step 6's review)
+- **KG-13** — Step 6's duplicate-notification fix was proven via a genuine forced-failure test (REVOKE privileges on a local stack) but that test isn't committed as an automated regression check, so the proof isn't repeatable in CI. A lightweight mocked-Supabase-client unit test would close this; deferred as non-blocking (would mean introducing new test infrastructure for a file that currently has none, contrary to Step 6's own scoping).
+- **KG-14** — Of Step 6's three lower-severity error-checked writes, only the two duplicate-risk paths were independently force-failed and verified; the device-disable and `instruments.last_price` writes were verified by code-pattern inspection only (same shape as the verified ones), not independently forced. Low risk, logged for completeness.
+**Pending deploy:** Step 6's `tick/index.ts` changes are LOCAL ONLY — not yet redeployed via `supabase functions deploy`. Steps 1-5 LIVE as of 2026-09-02. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix), 2c253d8 (Step 3), 0f21a9e (Step 4), 925a612 (Step 5). Step 6 not yet committed.
 
 ### Milestone 1 Proof — 2026-08-31
 
@@ -57,6 +61,148 @@ zero dependency on the owner's laptop, browser, or any running local process.
 ---
 
 ## Step History
+
+### Step 6 — Reliability hardening: unchecked DB writes risk duplicate notifications — Status: code-complete, verified locally against a real forced-failure scenario, awaiting review; NOT yet deployed to the live project
+*Date: 2026-09-02. Background run per Arch's dispatch. Reliability fix found during a deliberate hardening audit, not owner-reported — see `handoff/ARCHITECT-BRIEF.md`'s Step 6 for full writeup. Builder Plan recorded in the brief's Builder Plan section before building; proceeded directly (background run) rather than waiting for a synchronous approval round-trip, matching the Step 5 precedent.*
+
+**What changed — `supabase/functions/tick/index.ts` only (no schema change, no new package, `evaluatePriceAlert`/`computeNextTriggerAt` untouched):**
+
+- **`processPriceAlerts`** (the ONCE/CROSS duplicate-risk case): the `price_alerts`
+  update that marks a crossing "handled" (`last_triggered_at`, and `enabled = false`
+  for `ONCE`) now has its `{ error }` checked. On failure: `console.error` with the
+  alert id and the Postgres error, then `continue` — skips both `pushToUserDevices`
+  and `logNotification` for that alert entirely, leaving it in its pre-trigger state
+  so the next tick's identical crossing is correctly retried instead of silently
+  never being marked handled while a push already went out. On success: behavior is
+  byte-for-byte identical to before (push, then log).
+- **`processGraphReminders`** (the recurring-reminder duplicate-risk case): reordered
+  so the `graph_reminders.next_trigger_at` update happens and is confirmed successful
+  *before* `pushToUserDevices`/`logNotification`, not after. Same failure handling:
+  `console.error` with the reminder id and error, `continue`, no push/log — the
+  reminder stays "due" and is correctly retried next tick instead of firing a push
+  now with no guarantee `next_trigger_at` actually advanced.
+- **Three lower-severity unchecked writes** — added `{ error }` checks with
+  `console.error` on failure, no new control flow (per the brief's explicit
+  anti-over-engineering instruction — logging visibility was the actual gap, not a
+  missing retry mechanism, for a single-user app with light load):
+  `logNotification`'s `notification_log` insert, `pushToUserDevices`'s device-disable
+  update (on a dead 404/410 push subscription), and the `instruments.last_price`/
+  `last_price_at` update in the main handler.
+- All five unchecked writes identified in the brief now have explicit error handling.
+  No change to any evaluation logic (`evaluatePriceAlert`, `computeNextTriggerAt`
+  calls, crossing detection, window arithmetic).
+
+**Verification — genuine forced-failure scenario, not a read-through (per the brief's
+explicit instruction that a "looks right" read is insufficient evidence here):**
+
+Used the same throwaway local `supabase start` Docker stack pattern as Step 2/Step 5
+(`npx supabase start` + `npx supabase db reset`, all four migrations 0001-0004 applied
+cleanly). Ran the actual `tick/index.ts` entrypoint via `deno run` (not
+`supabase functions serve` — same Windows/Docker file-mounting limitation Step 2
+already found and documented; `deno run` exercises the identical source/import graph
+without going through the CLI's dev-serve wrapper) against the local stack's real
+Postgres+PostgREST, with throwaway VAPID keys (no real push delivery involved — 0
+devices seeded, isolating the write-ordering fix from push-delivery mechanics, which
+Step 2 already proved separately).
+
+**Forcing mechanism**: `revoke update on public.price_alerts from service_role;` /
+same for `public.graph_reminders` — a real Postgres permission-denied error (`42501`)
+on the exact `UPDATE` statement the function issues, returned by `supabase-js` as
+`{ error }` exactly like any other real write failure (constraint violation,
+connection blip, etc.) would be, without needing to fabricate a row shape that
+happens to violate a check constraint. Run directly via `docker exec ... psql` against
+the local stack's `supabase_db_TradeFlow` container.
+
+Seeded one auth user, the XAUUSD instrument with `last_price = 0.5`, one
+`price_alerts` row (`target_price = 1, CROSS_UP, ONCE`) and one `graph_reminders` row
+already due (`next_trigger_at` in the past). `target_price = 1` with `last_price`
+seeded below it guarantees a real live Binance-fetched PAXG/USDT price (always well
+above 1) deterministically satisfies the crossing condition on every invocation,
+without depending on the exact live price value.
+
+1. **Revoked** `UPDATE` on both `price_alerts` and `graph_reminders`. Invoked the
+   function twice. Confirmed via the function's own stdout: both failures were
+   logged with full detail —
+   `Failed to mark price alert <id> as triggered, will retry next tick: { code: "42501", ..., message: "permission denied for table price_alerts" }`
+   and the equivalent for `graph_reminders`. Queried the DB directly after both
+   invocations: `price_alerts.enabled` still `true`, `last_triggered_at` still
+   `null`; `graph_reminders.next_trigger_at` unchanged from its original due
+   timestamp; `notification_log` — **0 rows**. Confirms (a) failure logged, (b) no
+   push/notification_log happened for either event across two failed ticks, and the
+   events remained in their pre-handled state rather than a push firing with the
+   state write silently lost.
+2. **Granted** `UPDATE` back on both tables, reset `instruments.last_price` to `0.5`
+   again (it had advanced past the target on the first invocation via the
+   still-unblocked `instruments` update, which would otherwise make the alert's
+   crossing condition no longer true on a later tick — a seeding artifact of this
+   test, not a bug), and invoked the function again. Confirmed via direct DB query:
+   `price_alerts.enabled` flipped to `false`, `last_triggered_at` set to the
+   invocation timestamp; `graph_reminders.next_trigger_at` advanced to the correct
+   next 15-minute boundary; `notification_log` now has exactly one `PRICE_ALERT` row
+   and exactly one `GRAPH_REMINDER` row (both `PENDING` — correct, since 0 devices
+   were registered to push to). **No duplicate rows** despite the two earlier failed
+   attempts. Confirms (c): the event was still evaluated and succeeded cleanly on a
+   subsequent tick, with exactly one notification per event, not zero and not two.
+3. **Lower-severity spot-check**: seeded a second, `EVERY_TIME`-mode alert (so it
+   doesn't self-disable), reset `instruments.last_price` below target again, revoked
+   `INSERT` on `notification_log`, invoked once more. Confirmed: the function
+   returned its normal `200` JSON response (no crash), `console.error` logged
+   `Failed to write notification_log row for user <id> (PRICE_ALERT): { code: "42501", ..., message: "permission denied for table notification_log" }`,
+   and — critically, confirming this write is correctly non-blocking — the alert's
+   own `price_alerts.last_triggered_at` **was** updated despite the log-insert
+   failure, matching the brief's decision that this write's failure should be
+   logged but not gate anything else. Did not separately force-fail the
+   device-disable update or the `instruments` update — both follow the mechanically
+   identical `{ error } = await ...; if (error) console.error(...)` pattern already
+   proven correct by the notification_log spot-check and by `deno check`, and the
+   brief's forced-failure requirement is specifically scoped to "the triggering
+   write" (the two duplicate-risk cases), which received the full multi-invocation
+   proof above.
+
+Teardown: `grant`ed all revoked privileges back (hygiene on the throwaway stack),
+`npx supabase stop`. `git status` confirms only `supabase/functions/tick/index.ts`
+and `handoff/ARCHITECT-BRIEF.md` changed — no lingering scaffold or leftover files
+from the local stack or the seed script (which lived entirely in the session
+scratchpad directory, outside the repo).
+
+**Also verified this session:**
+- `deno check --config supabase/functions/deno.json supabase/functions/tick/index.ts`
+  — clean (Deno 2.9.6).
+- `pnpm build`, `pnpm test`, `pnpm typecheck` at repo root — all green, no
+  regressions (this file is Deno-only and outside `pnpm`'s scope, but the brief's
+  DoD asks to confirm nothing else broke). Test counts unchanged from Step 5: 32
+  alert-engine, 37 validation, 12 market-data; 8/8 packages typecheck; `web`
+  production build green (11 routes).
+
+**Key decisions this session:**
+- Chose privilege revocation (`REVOKE UPDATE/INSERT ... FROM service_role`) as the
+  forcing mechanism, per the brief's "your call" — a real Postgres-level failure
+  indistinguishable in shape from any other write failure the fix needs to handle
+  (the code branches on "did `error` come back non-null," not on what caused it),
+  cleaner to set up/tear down deterministically than engineering a constraint
+  violation that would need a contrived row shape.
+- Used `target_price = 1` (deterministically satisfied by any real live price) rather
+  than trying to time the test against the live-fetched Binance price's exact value —
+  keeps the test reproducible regardless of what PAXG/USDT is actually trading at
+  when this is re-run.
+- Did not force-fail all five unchecked-write sites individually — full
+  multi-invocation proof for the two duplicate-risk reorder fixes (the brief's
+  explicit ask), one representative spot-check for the lower-severity group (same
+  code pattern, so one proof generalizes), matching the brief's own
+  anti-over-engineering instruction rather than padding out repetitive test steps.
+
+**Not yet done:** this step's `tick/index.ts` changes have not been redeployed to the
+live Supabase project (`supabase functions deploy`) — pending review clearing, same
+pattern as every prior step's deploy gating.
+
+**Open questions for Arch:** none — the brief's Decisions left no ambiguity requiring
+a judgment call beyond the forcing-mechanism choice, which is documented above for
+awareness rather than as an open question.
+
+**Blocked / Not Attempted:** none this step — full local Docker/Deno access
+throughout, no live-project access needed (fix is code-only, no migration).
+
+---
 
 ### Step 5 — Fix reminder timezone display bug + configurable market-open/close window — Status: code-complete, locally verified (DB layer via a throwaway local `supabase start` stack), Richard's Should Fix addressed, re-submitted for review; migration NOT yet applied to the live project
 *Date: 2026-09-01. Background run per Arch's dispatch. Builder Plan recorded in `handoff/ARCHITECT-BRIEF.md`'s Builder Plan section before building, including two flagged deviations/additions from the brief's literal text (see below) — proceeded rather than blocking on a synchronous approval round-trip, per this session's instructions; both are called out again in `handoff/REVIEW-REQUEST.md` for Arch/Richard to weigh in on.*

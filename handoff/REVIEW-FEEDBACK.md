@@ -1,139 +1,88 @@
-# Review Feedback — Step 5
-Date: 2026-09-01
+# Review Feedback — Step 6
+Date: 2026-09-02
 Ready for Builder: YES
 
 ## Must Fix
 None.
 
 ## Should Fix
-- `packages/alert-engine/src/__tests__/computeNextTriggerAt.test.ts` — the new window
-  tests only exercise a fixed-offset, non-DST zone (`Asia/Kuala_Lumpur`). The
-  pre-existing no-window suite already carries a DST-transition test ("1H across a US
-  DST fall-back transition"), which is the established rigor bar for this exact
-  function — the window branch doesn't meet it yet. This is not a Must Fix: by
-  inspection, the window helpers (`minutesToNextPeriodicOccurrence`,
-  `minutesToNextDailyOccurrence`) do pure wall-clock-minutes arithmetic on the value
-  `getWallClock` already returns, and the result is handed to the same
-  `zonedWallClockToUtc` fixed-point conversion the no-window branches use unchanged —
-  there is no separate DST-sensitive code path introduced by the window logic, so the
-  existing DST-safety argument for the no-window branches extends to the window branch
-  by construction, not by coincidence. Given the product is XAUUSD-only and the
-  realistic user base skews to non-DST zones (Asia/Kuala_Lumpur), the practical risk is
-  low. Recommend adding one test mirroring the existing DST fall-back case but with a
-  `window` arg (e.g. an overnight window in `America/New_York` spanning the Nov 1
-  transition), logged to BUILD-LOG if not done inline — closes the coverage gap rather
-  than leaving an asymmetry between the window and no-window suites.
+- `supabase/functions/tick/index.ts` (`processPriceAlerts`, `processGraphReminders`) —
+  the proof that the update-before-push ordering holds under real failure is manual
+  and ephemeral (local Docker stack, torn down after use). There's no committed
+  automated test (e.g. a mocked `SupabaseClient` returning `{ error }` truthy on the
+  `price_alerts`/`graph_reminders` update) that would catch a future regression of
+  this ordering in CI. Recommend adding one — low effort, and this is exactly the
+  kind of control-flow invariant that's easy to silently break in a later edit.
+- Verification only force-failed one of the three lower-severity writes
+  (`notification_log` insert). The device-disable update (~line 128) and the
+  `instruments.last_price` update (~line 356) were not independently forced to fail —
+  justified in BUILD-LOG as "identical code pattern to the one just proven." I agree
+  the pattern is structurally identical (checked by code read, see Cleared below) so
+  this isn't a blocker, but it's worth naming explicitly as an accepted verification
+  gap rather than letting "all three lower-severity writes were forced-failed" be
+  assumed from the report.
 
 ## Escalate to Architect
-None. Bob's three "Open Questions" are all resolved at the code/arithmetic level (see
-Cleared below) — none require a product decision.
+None.
 
 ## Cleared
 
-**1. Window-arithmetic re-derived independently, from scratch, against the brief's three
-worked examples plus additional boundary cases — all match the code and the tests:**
-- *06:00–22:00, 4H, from=09:00*: `offset=180`, `currentSlot=0`, `nextSlotOffset=240<960`
-  → `+60min` → **10:00 today**. Matches brief and test.
-- *06:00–22:00, 4H, from=22:00 exactly (window's own end)*: `offset=960`, not `<
-  windowLength(960)` → outside branch → `1440-960=480` → **06:00 next day**. Confirms
-  the window end is correctly exclusive (never itself a fireable slot).
-- *06:00–22:00, 4H, from=10:00 exactly (a valid slot)*: `offset=240<960`,
-  `currentSlot=1`, `nextSlotOffset=480<960` → `+240min` → **14:00 same day** — confirms
-  "at a slot" correctly returns the *next* slot, not the same instant (consistent with
-  the no-window branches' existing "strictly after `from`" contract).
-- *Overnight 22:00–06:00, 1H, from=05:30 (the trickiest case)*: `offset=((330-1320)%1440+1440)%1440
-  = 450`, `currentSlot=7`, `nextSlotOffset=480`, not `<480` → rollover →
-  `1440-450=990min` → **22:00 same day**. Independently confirms Bob's/Arch's math:
-  the brief's own suggested formula `(windowLength-offset+1440)%1440 = (480-450+1440)%1440
-  = 30` would give **06:00** — the window's own end, an invalid occurrence — so the
-  brief's literal suggestion is wrong and `1440-offset` is correct. I re-derived this
-  from the number line myself rather than trusting either party's arithmetic: both
-  the "rolled off the last in-window slot" and "currently outside the window" cases are
-  measuring distance to the *next window-start* event, which recurs every 1440 minutes
-  from the most recent start — i.e. distance to `offset=1440`, which is exactly
-  `1440-offset` in both cases. The brief's formula instead measures distance to
-  `offset=windowLength` (the window's *end*, mod 1440), which is a different — and
-  wrong — target. This isn't a coincidence that both branches share a formula; it's
-  because they're the same target event measured the same way.
-- *Overnight window, from=06:00 exactly (window's own end)*: `offset=480`, not `<480` →
-  outside → `1440-480=960min` → **22:00 same day** (16h later) — correct, matches the
-  "window end is exclusive, next start is later today" expectation.
+**1. Ordering / no-fallthrough check (processPriceAlerts, processGraphReminders).**
+Read both functions in full. In `processPriceAlerts` (lines 220-262 of the current
+file): `evaluatePriceAlert` gate at line 220 (`continue` if false) → `triggered++` →
+the `price_alerts` update at line 231 → `if (updateError) { console.error(...);
+continue; }` at 232-235 → only then the direction-wording, `pushToUserDevices` call
+(249), and `logNotification` call (255). No code path reaches the push after a failed
+update — the `continue` is unconditional on error, no other branch skips it. Same
+shape in `processGraphReminders` (lines 291-311): `computeNextTriggerAt` →
+`graph_reminders` update (297) → `if (updateError) { console.error(...); continue;
+}` (301-304) → then `pushToUserDevices` (306) and `logNotification` (312). Confirmed
+via `git diff HEAD -- supabase/functions/tick/index.ts` that the `graph_reminders`
+update block was moved earlier in the function (previously ran after the push/log)
+rather than duplicated or left in both places.
 
-**2. No-window path confirmed a true byte-for-byte no-op by reading the diff, not
-trusting the claim**: `git diff HEAD -- packages/alert-engine/src/computeNextTriggerAt.ts`
-shows the entire pre-existing function body (the `1D`/periodic non-window branches,
-lines ~207–242) is untouched context in the diff — no removed or modified lines, only
-additions (new helpers, new interface, and a new `if (window) { ...; return ...; }`
-block inserted before the untouched original code). When `window` is `undefined`, that
-`if` block is skipped entirely and execution falls through to the exact original code
-path. The new "passing `undefined` explicitly" test and the two no-window regression
-tests in the test diff pass, and all 9 original test cases are present unchanged and
-still pass (31/31 in the full suite, confirmed by running `pnpm --filter
-@tradeflow/alert-engine test` myself).
+**2. Three lower-severity writes.** All three now check `error` and `console.error`
+on failure, no control-flow change, matching the report:
+- `logNotification`'s `notification_log` insert (lines 168-182) — error checked,
+  logged, function still returns normally.
+- `pushToUserDevices`'s device-disable update (lines 128-134) — `disableError`
+  checked, logged; the outer per-device loop is unaffected either way.
+- Main handler's `instruments.last_price`/`last_price_at` update (lines 356-362) —
+  `instrumentUpdateError` checked, logged; no branching added.
 
-**3. 1D-window generalization verified to reduce to the existing behavior at
-`startMinutes=0`, both algebraically and by test**: at `startMinutes=0`,
-`offset = ((m-0)%1440+1440)%1440 = m` (since `m` is already in `[0,1440)`), so
-`1440-offset = 1440-m` — the exact distance from `from` to *tomorrow's* midnight. The
-existing untouched no-window 1D branch computes "floor to today's local midnight, add
-24h," which — since today's midnight is always in the past relative to any `m>=0` — is
-also always exactly `1440-m` minutes ahead of `from`. The two formulas are identical at
-`startMinutes=0` for exactly the reason Bob states, and I confirmed this reduction
-holds independent of Bob's own reasoning. The pre-existing 1D test cases ("1D in UTC
-advances to the next local midnight", "1D in a fixed +8 timezone…") are present
-unchanged in the test diff and pass (confirmed by test run) — they exercise exactly
-this reduction. Separately hand-verified the generalization's three new behaviors
-(anchor still ahead today → today's occurrence; anchor already passed → tomorrow's;
-`from` exactly at the anchor → strictly the *following* day, not now) against the new
-1D-window tests — all check out and are internally consistent with how the periodic
-branch treats "exactly at a slot."
+**3. Business logic untouched.** `git diff HEAD -- supabase/functions/tick/index.ts`
+against commit `925a612` (last commit to touch this file) shows only: (a) the two
+update blocks reordered/relocated, (b) `error`-destructuring plus an `if (error)
+console.error(...)` added at five call sites, (c) a `continue` added at the two
+duplicate-risk sites. The `evaluatePriceAlert(...)` call, its arguments, the
+crossed-up/down wording logic, and the `computeNextTriggerAt(reminder.timeframe,
+reminder.timezone, now, buildReminderWindowArg(reminder))` call and its arguments are
+byte-for-byte identical to before — the diff hunk for the reminder update shows it as
+a pure cut-and-paste (removed from its old position, added earlier, no line inside it
+changed). No business-logic drift.
 
-**4. DST + window interaction** — assessed and flagged above (Should Fix), not a
-blocker. See reasoning there.
+**4. Verification method assessment.** REVOKE-based forced failure against a real
+local Postgres/Supabase stack is a legitimate and, for this specific fix, a *better*
+proof than a read-through or a mock: `supabase-js` doesn't throw on failure, so the
+bug this step fixes is entirely about whether code correctly branches on a populated
+`error` field — REVOKE produces a genuine `42501` on the exact statement in question,
+which is indistinguishable in shape from any other real write failure the fix is
+meant to handle (network blip, RLS misconfig, connection exhaustion, etc.), and the
+before/after DB-state check (0 rows / correct final state, then exactly one row per
+event with no duplicates after re-granting) is the right thing to assert — it directly
+tests the duplicate-notification risk the step exists to close, not just "did the
+function not crash." I don't think a mocked unit test replaces this for initial proof
+of the fix; I do think one should exist going forward for regression protection (see
+Should Fix above) — that's a complement, not a substitute.
 
-**5. `supabase/migrations/0004_reminder_window.sql`** — `CHECK ((window_start_time IS
-NULL) = (window_end_time IS NULL))` is correct: both-null → `true=true` → passes;
-both-set → `false=false` → passes; exactly one set → `true=false` or `false=true` →
-fails, correctly rejecting the one-of-two case. This is plain, unremarkable DDL (two
-nullable `time` columns + one boolean-equality CHECK) against a table
-(`graph_reminders`) that already exists as of `0001_init.sql`, with no dependency on
-anything that could plausibly fail on a fresh local stack — Bob's local-verification
-claim (clean apply of `0001`–`0004` in order, columns and constraint present, one-sided
-insert rejected, both-sided insert round-tripped correctly) is fully consistent with
-what the SQL itself says should happen.
+**5. RLS/auth regression check.** Single `createClient(...)` call in the file (main
+handler, using `SUPABASE_SERVICE_ROLE_KEY`), unchanged by this diff and unchanged in
+purpose — this file's whole reason for using the service-role client (no logged-in
+user in a cron context) predates this step and nothing here shifts additional logic
+onto it inappropriately. No other client instantiation in the file. No new tables or
+RLS-sensitive access introduced. No regression.
 
-**6. Validation schema** (`packages/validation/src/graphReminder.ts`) — traced by hand:
-both omitted → both normalize to explicit `null`; both explicit `null` → same; one
-set/one absent (both directions) → `refine` fails (`startIsNull !== endIsNull`) →
-correctly rejected; both set, distinct (including the overnight-wrapping case, start >
-end) → passes through unchanged, since the regex validates format only, not ordering;
-both set and equal (e.g. `"09:00"`/`"09:00"`) → `transform` correctly normalizes to
-`null`/`null`; malformed (`"6:00"`) or out-of-range (`"25:00"`) strings fail the
-per-field regex before the object-level refine/transform ever runs. All of this matches
-the new test file's 19 new cases (I read the diff directly, not just the pass/fail
-count) and the full 37/37 test run I executed.
-
-**7. `supabase/functions/tick/index.ts` scope addition** — confirmed genuinely
-necessary: the `processGraphReminders` query already does `select("*, instruments(symbol)")`
-(a wildcard), so `window_start_time`/`window_end_time` will be present on `reminder`
-once the migration lands, with no select-list change needed. Before this fix, the
-`computeNextTriggerAt` call passed only 3 args (no window) — confirmed by the diff — so
-any windowed reminder would have its window silently dropped on every recompute after
-its first fire, reverting to unrestricted/midnight-anchored behavior. The added
-`timeStringToMinutes`/`buildReminderWindowArg` helpers are straightforward
-string-to-minutes conversions mirroring `reminder-actions.ts`'s equivalent, and
-`deno check index.ts` (re-run myself, Deno 2.9.6) is clean. Correct call to bring this
-in-scope rather than ship a feature that regresses itself within one tick cycle.
-
-**8. Standard checks** — `reminder-actions.ts`'s auth/RLS defense-in-depth pattern
-(`.eq("user_id", user.id)` on every read/update/delete, explicit `user_id: user.id` on
-insert) is unchanged and present on all the modified action functions, including the
-new `existing` fetch added for the window-aware `scheduleChanged` comparison in
-`updateReminderAction`. `reminders/page.tsx`'s `formatDate` fix correctly threads the
-reminder's own `timezone` column (already fetched via `select("*, ...")`, filtered by
-`user_id`) into `toLocaleString`'s `timeZone` option — the only call site, confirmed by
-reading the full file, not just the diff.
-
-**General**: `pnpm build`, `pnpm test` (31 alert-engine, 37 validation, all passing —
-re-run myself), and `pnpm typecheck` (re-run myself, all 8 workspace packages green)
-all corroborate Bob's claims independently rather than trusting the report.
+**Overall**: reviewed the full current `supabase/functions/tick/index.ts` and diffed
+it against the last commit that touched it. The fix is exactly what was claimed — a
+pure control-flow/error-handling change, correctly ordered, with no fallthrough after
+a failed state-changing write and no business-logic drift. Step 6 is clear.

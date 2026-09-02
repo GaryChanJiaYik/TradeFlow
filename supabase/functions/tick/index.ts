@@ -125,7 +125,13 @@ async function pushToUserDevices(
     } catch (err) {
       const statusCode = (err as { statusCode?: number }).statusCode;
       if (statusCode === 404 || statusCode === 410) {
-        await supabase.from("devices").update({ enabled: false }).eq("id", device.id);
+        const { error: disableError } = await supabase
+          .from("devices")
+          .update({ enabled: false })
+          .eq("id", device.id);
+        if (disableError) {
+          console.error(`Failed to disable dead device ${device.id}:`, disableError);
+        }
       } else {
         console.error(`Push failed for device ${device.id}:`, err);
       }
@@ -159,7 +165,7 @@ async function logNotification(
   const status: "SENT" | "FAILED" | "PENDING" =
     params.push.attempted === 0 ? "PENDING" : params.push.sent > 0 ? "SENT" : "FAILED";
 
-  await supabase.from("notification_log").insert({
+  const { error } = await supabase.from("notification_log").insert({
     user_id: params.userId,
     device_id: null,
     event_type: params.eventType,
@@ -168,6 +174,12 @@ async function logNotification(
     status,
     sent_at: status === "SENT" ? new Date().toISOString() : null,
   });
+  if (error) {
+    console.error(
+      `Failed to write notification_log row for user ${params.userId} (${params.eventType}):`,
+      error,
+    );
+  }
 }
 
 async function processPriceAlerts(
@@ -208,9 +220,19 @@ async function processPriceAlerts(
     if (!evaluatePriceAlert(evaluable, previousPrice, currentPrice, now)) continue;
     triggered++;
 
+    // The write that marks this crossing "handled" must be confirmed
+    // successful *before* a push is sent. If it fails, the alert's state
+    // never changes, so skip the notification and let the next tick see
+    // the identical crossing as still valid and correctly retry — instead
+    // of firing a push now and potentially firing a duplicate next tick
+    // too. See handoff/ARCHITECT-BRIEF.md Step 6.
     const update: Record<string, unknown> = { last_triggered_at: now.toISOString() };
     if (alert.trigger_mode === "ONCE") update.enabled = false;
-    await supabase.from("price_alerts").update(update).eq("id", alert.id);
+    const { error: updateError } = await supabase.from("price_alerts").update(update).eq("id", alert.id);
+    if (updateError) {
+      console.error(`Failed to mark price alert ${alert.id} as triggered, will retry next tick:`, updateError);
+      continue;
+    }
 
     // Only used to word the notification (which direction actually
     // happened) — not a re-decision of whether the alert should fire;
@@ -261,6 +283,26 @@ async function processGraphReminders(
     const trimmedDescription = reminder.description?.trim();
     const message = trimmedDescription ? trimmedDescription : `Check the ${symbol} ${reminder.timeframe} chart.`;
 
+    // Same ordering requirement as processPriceAlerts: advance
+    // next_trigger_at and confirm it succeeded *before* sending a push. If
+    // the write fails, the reminder stays "due" and the next tick correctly
+    // retries it instead of also firing a duplicate push here. See
+    // handoff/ARCHITECT-BRIEF.md Step 6.
+    const nextTriggerAt = computeNextTriggerAt(
+      reminder.timeframe,
+      reminder.timezone,
+      now,
+      buildReminderWindowArg(reminder),
+    );
+    const { error: updateError } = await supabase
+      .from("graph_reminders")
+      .update({ next_trigger_at: nextTriggerAt.toISOString() })
+      .eq("id", reminder.id);
+    if (updateError) {
+      console.error(`Failed to advance graph reminder ${reminder.id}, will retry next tick:`, updateError);
+      continue;
+    }
+
     const push = await pushToUserDevices(supabase, reminder.user_id, {
       title,
       body: message,
@@ -274,17 +316,6 @@ async function processGraphReminders(
       message,
       push,
     });
-
-    const nextTriggerAt = computeNextTriggerAt(
-      reminder.timeframe,
-      reminder.timezone,
-      now,
-      buildReminderWindowArg(reminder),
-    );
-    await supabase
-      .from("graph_reminders")
-      .update({ next_trigger_at: nextTriggerAt.toISOString() })
-      .eq("id", reminder.id);
   }
 
   return { evaluated: reminders.length, triggered: reminders.length };
@@ -319,11 +350,16 @@ Deno.serve(async (_req: Request) => {
       summary.priceAlerts = await processPriceAlerts(supabase, instrument, tick.price, now);
 
       // Unconditionally update the tick baseline, even with zero triggers,
-      // so the next invocation has a correct "previous price."
-      await supabase
+      // so the next invocation has a correct "previous price." A failure
+      // here just delays detection by one tick (self-corrects next
+      // invocation) — logged for visibility, no retry logic needed.
+      const { error: instrumentUpdateError } = await supabase
         .from("instruments")
         .update({ last_price: tick.price, last_price_at: tick.timestamp })
         .eq("id", instrument.id);
+      if (instrumentUpdateError) {
+        console.error(`Failed to update instrument ${instrument.id} last_price:`, instrumentUpdateError);
+      }
     } catch (err) {
       const reason = err instanceof BinanceProviderError ? `${err.code}: ${err.message}` : String(err);
       console.error("Binance price fetch failed:", reason);
