@@ -5,10 +5,10 @@
 
 ## Current Status
 
-**Active step:** Step 5 (reminder timezone display fix + market-open/close window) — Richard's 2026-09-01 review returned `Ready for Builder: YES`, no Must Fix, one Should Fix (window-branch DST test coverage gap) — addressed same day, see Step 5 entry below. Re-submitted for review. Steps 3 and 4 remain live in production, unaffected by Step 5's in-progress changes. Milestone 1 remains proven — see "Milestone 1 Proof" below.
-**Last cleared:** Step 4 — 2026-08-31, Richard's review (independently reproduced every claim: read both guards for a fall-through path, diffed extracted forms against git history, re-ran the grep audit himself, own local build + curl verification).
-**Blocked on:** Step 5's migration (`0004_reminder_window.sql`) is written but not applied to the live project (network blocks direct Postgres connections, same as KG-8) — Arch needs to apply it via the Supabase dashboard SQL Editor before Step 5's live verification (Build Order step 6) can happen. See Step 5's BUILD-LOG entry for full detail.
-**Pending deploy:** LIVE as of 2026-08-31. Confirmed via production curl: `/dashboard/alerts/new` and `/dashboard/reminders/new` now correctly return 307 -> `/login` for unauthenticated requests, with no form content in the body (verified — an earlier grep hit on "Direction" was a false positive from `flexDirection` in an embedded style, not the form). Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix), 2c253d8 (Step 3), 0f21a9e (Step 4).
+**Active step:** Step 5 CLEAR and deployed. Migration `0004_reminder_window.sql` applied live via the Supabase dashboard SQL Editor (2026-09-02), `tick` function and web app both redeployed, owner confirmed via the live UI that the "Next occurrence" display and the market-open/close window both work correctly. Steps 1-5 are all live in production. Milestone 1 remains proven — see "Milestone 1 Proof" below.
+**Last cleared:** Step 5 — 2026-09-01/02, Richard's review (independently re-derived the window arithmetic from scratch, confirmed the no-window path is a true no-op via diff, confirmed the 1D generalization algebraically) plus one Should Fix (DST+window test coverage) closed same cycle.
+**Blocked on:** nothing currently.
+**Pending deploy:** LIVE as of 2026-09-02. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix), 2c253d8 (Step 3), 0f21a9e (Step 4), 925a612 (Step 5).
 
 ### Milestone 1 Proof — 2026-08-31
 
