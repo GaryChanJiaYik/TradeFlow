@@ -1,56 +1,52 @@
-# Session Checkpoint — 2026-08-31
+# Session Checkpoint — 2026-09-02
 
 ---
 
 ## Where We Stopped
 
-**Milestone 1 is proven.** The spec's primary success criterion — create an XAUUSD
-alert, laptop off, cloud detects a real crossing, phone receives a push notification
-— is confirmed working end-to-end in production. Full verification (server-side
-`price_alerts`/`notification_log`/`instruments` state, plus the owner's own phone)
-is logged in `handoff/BUILD-LOG.md`'s "Milestone 1 Proof" section.
+Steps 1-5 are all built, reviewed, deployed, and owner-verified live in production:
+- Step 1-2: auth, price alerts, Binance PAXG feed, cron worker, Web Push (Milestone 1 proven).
+- Step 3: graph reminders CRUD.
+- Step 4: fixed unauthenticated access to the "new alert"/"new reminder" pages.
+- Step 5: fixed a reminder-timezone display bug (stored values were always correct;
+  display wasn't converting to the reminder's own timezone on Cloudflare Workers'
+  UTC-default runtime) and added an optional per-reminder market-open/close window
+  that anchors the 15m/1H/4H/1D grid to a custom start time instead of midnight.
 
-Everything is deployed and live:
-- Web app: https://tradeflow-web.garychanjiayik.workers.dev (Cloudflare Workers)
-- `tick` Edge Function: deployed, scheduled via pg_cron every 2 minutes
-- Code: pushed to https://github.com/GaryChanJiaYik/TradeFlow (branch `main`)
+Live at:
+- Web app: https://tradeflow-web.garychanjiayik.workers.dev
+- Code: https://github.com/GaryChanJiaYik/TradeFlow (branch `main`)
 
-Per the spec's own instruction (section 29): "If YES: the architecture is proven."
-The next conversation should NOT restart infrastructure work — it should move to
-V1's remaining features (Feature B: graph reminders has schema but no UI yet) or
-begin V2 per the roadmap, unless the owner directs otherwise.
-
----
-
-## What Was Decided This Session
-
-- (Carried from before) Binance PAXG/USDT as the XAUUSD source, no offset applied.
-- Owner's network blocks direct Postgres ports (5432/6543) — confirmed via raw TCP
-  tests. `supabase db push`/`migration list` cannot run from this machine; future
-  migrations need the Supabase dashboard SQL Editor instead (HTTPS-based, unaffected).
-- Cloudflare deploy required `shamefully-hoist=true` + `node-linker=hoisted` in a new
-  root `.npmrc` — a documented fix for a pnpm + `@opennextjs/cloudflare` middleware-
-  manifest bug (dynamic `require()` unsupported in the Workers ESM runtime). Confirmed
-  via live `wrangler tail` logs and a matching upstream GitHub issue, not guessed.
-- Web Push subscriptions are per-browser-per-device — the first "Enable notifications"
-  click was on the owner's laptop, which would NOT have survived the laptop being off.
-  Caught before the proof attempt; the owner re-registered from their phone's browser
-  specifically, which is what actually received the notification.
+Nothing is currently blocked. Ready for the next piece of work — no open bugs or
+pending reviews as of this checkpoint.
 
 ---
 
-## Still Open (not blocking, for whenever)
+## What Was Decided This Session (since the last checkpoint)
 
-- KG-8 (from Step 2 deployment): the CLI's migration-history table doesn't know about
-  `0001`-`0003` since they were applied via SQL Editor, not `supabase db push`. Keep
-  this in mind for the next migration.
-- Graph reminders (Feature B) has schema (`graph_reminders` table, evaluated by the
-  `tick` function already) but no UI yet — natural next vertical slice.
-- No native mobile app (Web Push to an installed PWA was used instead, per an earlier
-  decision) — still a valid V1 scope choice, revisit only if the owner wants a real
-  app icon/store presence.
+- Reminder scheduling window arithmetic: next-occurrence-after-rollover distance is
+  `1440 - offset` (window instances repeat every 1440 minutes regardless of window
+  length) — a formula Arch's own brief got wrong on the first attempt; Bob caught it,
+  Richard independently re-derived and confirmed it in a separate review pass.
+- Window is per-reminder (not global), stored as nullable `time` columns
+  (`window_start_time`/`window_end_time`), both-or-neither enforced at both the DB
+  (CHECK constraint) and validation (zod refine) layers. Equal start/end values
+  normalize to null/null ("no restriction"), per the owner's own framing.
+- Confirmed this network cannot run `supabase db push`/`migration list` at all
+  (direct Postgres ports blocked) — every schema change from here needs the same
+  dashboard SQL Editor workaround used for `0003_cron.sql` and `0004_reminder_window.sql`.
+
+---
+
+## Still Open (not blocking, background awareness)
+
 - OANDA (or another broker feed) remains a clean future upgrade via the
   `MarketDataProvider` abstraction, if broker account access ever gets sorted.
+- No native mobile app (Web Push to an installed PWA instead) — still a valid V1
+  scope choice.
+- Spec Phase 17 (general polish/security/reliability hardening) hasn't been
+  deliberately worked through yet, though Steps 4-5 both originated as exactly that
+  kind of hardening found via ad-hoc testing rather than a systematic pass.
 
 ---
 
