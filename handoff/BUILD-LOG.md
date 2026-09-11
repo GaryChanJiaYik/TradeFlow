@@ -5,9 +5,10 @@
 
 ## Current Status
 
-**Active step:** Step 7 code-complete, both Should Fix items from Richard's 2026-09-11 review addressed inline, re-submitted for review; NOT yet deployed to the live project. Step 6 remains CLEAR but also still pending redeploy (unaffected by Step 7's changes).
-**Last cleared:** Step 6 — 2026-09-02, Richard's review (confirmed no fall-through path from a failed update to a push/log; diffed against commit 925a612 confirming zero business-logic change; assessed the REVOKE-based forced-failure method as legitimate). Two non-blocking Should Fix items logged below (KG-13, KG-14).
+**Active step:** Step 7 CLEAR and deployed. Also deployed Step 6 (was clear but pending redeploy). Both live in production. Confirmed post-deploy: `instruments.last_price_at` is updating on the normal ~2-minute cadence.
+**Last cleared:** Step 7 — 2026-09-11, Richard's two-round review (round 1: core staleness/fallback logic, no Must Fix; round 2: confirmed both Should Fix items closed correctly, "Step 7 is clear").
 **Blocked on:** nothing currently.
+**Note:** an unexplained, unreviewed `"workspaces"` field appeared in root `package.json` during Step 7's build session — not part of anything in the brief or Bob's own reports. Reverted before commit (pnpm doesn't use that field anyway; it's the npm/yarn convention). Worth a closer look if it recurs.
 
 ### Known Gaps (added from Step 6's review)
 - **KG-13** — Step 6's duplicate-notification fix was proven via a genuine forced-failure test (REVOKE privileges on a local stack) but that test isn't committed as an automated regression check, so the proof isn't repeatable in CI. A lightweight mocked-Supabase-client unit test would close this; deferred as non-blocking (would mean introducing new test infrastructure for a file that currently has none, contrary to Step 6's own scoping).
