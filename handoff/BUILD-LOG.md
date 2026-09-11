@@ -5,14 +5,14 @@
 
 ## Current Status
 
-**Active step:** Step 6 CLEAR, pending redeploy of the `tick` Edge Function (code committed, not yet pushed to the live Supabase project — Steps 1-5 remain live and unaffected).
+**Active step:** Step 7 code-complete, both Should Fix items from Richard's 2026-09-11 review addressed inline, re-submitted for review; NOT yet deployed to the live project. Step 6 remains CLEAR but also still pending redeploy (unaffected by Step 7's changes).
 **Last cleared:** Step 6 — 2026-09-02, Richard's review (confirmed no fall-through path from a failed update to a push/log; diffed against commit 925a612 confirming zero business-logic change; assessed the REVOKE-based forced-failure method as legitimate). Two non-blocking Should Fix items logged below (KG-13, KG-14).
 **Blocked on:** nothing currently.
 
 ### Known Gaps (added from Step 6's review)
 - **KG-13** — Step 6's duplicate-notification fix was proven via a genuine forced-failure test (REVOKE privileges on a local stack) but that test isn't committed as an automated regression check, so the proof isn't repeatable in CI. A lightweight mocked-Supabase-client unit test would close this; deferred as non-blocking (would mean introducing new test infrastructure for a file that currently has none, contrary to Step 6's own scoping).
 - **KG-14** — Of Step 6's three lower-severity error-checked writes, only the two duplicate-risk paths were independently force-failed and verified; the device-disable and `instruments.last_price` writes were verified by code-pattern inspection only (same shape as the verified ones), not independently forced. Low risk, logged for completeness.
-**Pending deploy:** Step 6's `tick/index.ts` changes are LOCAL ONLY — not yet redeployed via `supabase functions deploy`. Steps 1-5 LIVE as of 2026-09-02. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix), 2c253d8 (Step 3), 0f21a9e (Step 4), 925a612 (Step 5). Step 6 not yet committed.
+**Pending deploy:** Steps 6 AND 7's `tick/index.ts` changes are LOCAL ONLY — not yet redeployed via `supabase functions deploy`. Steps 1-5 LIVE as of 2026-09-02. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix), 2c253d8 (Step 3), 0f21a9e (Step 4), 925a612 (Step 5), 49e6b74 (Step 6). Step 7 not yet committed.
 
 ### Milestone 1 Proof — 2026-08-31
 
@@ -61,6 +61,136 @@ zero dependency on the owner's laptop, browser, or any running local process.
 ---
 
 ## Step History
+
+### Step 7 — ChartGoldPriceProvider as primary XAUUSD source, Binance as automatic fallback — Status: code-complete, verified locally (mocked-fetch unit tests + a real live smoke-test call), awaiting review; NOT yet deployed to the live project
+*Date: 2026-09-11. Background run per Arch's dispatch. Owner-researched replacement primary price source — see `handoff/ARCHITECT-BRIEF.md`'s Step 7 for full writeup (why chartgoldprice.com was chosen over three ruled-out alternatives, and why it's wired as primary-with-fallback rather than a hard swap). Builder Plan recorded in the brief's Builder Plan section before building; proceeded directly (background run) rather than waiting for a synchronous approval round-trip, matching the Step 5/6 precedent.*
+
+**What was added:**
+
+- **`packages/market-data/src/chartGoldPriceProvider.ts`** — new `ChartGoldPriceProvider`
+  implementing `MarketDataProvider` against `GET https://www.chartgoldprice.com/api/data`,
+  parsing `prices.gold.troy_ounce` as price. Mirrors `BinanceProvider`'s shape exactly
+  (injectable `fetchFn`, typed `ChartGoldPriceProviderError` with a `code`, never
+  returns/propagates `NaN`). Also parses `meta.updated_at` and throws a `STALE_DATA`
+  error if it's more than 15 minutes older than "now" at call time (an injectable `now`
+  config, defaulting to `() => new Date()`, makes this independently testable) — a
+  missing/unparsable `updated_at` is treated the same way, not silently ignored.
+- **`packages/market-data/src/fallbackProvider.ts`** — new `FallbackMarketDataProvider`
+  implementing `MarketDataProvider`, constructed with an ordered
+  `readonly MarketDataProvider[]`. `getPrice` tries each in order; on any thrown error,
+  `console.error`s `"<ProviderName> failed: <reason>"` (using `provider.constructor.name`
+  as the label, since `MarketDataProvider` is a bare interface with no name field of its
+  own) and falls through to the next. Returns the first success completely untouched —
+  the winning provider's own `PriceUpdate.provider` field is what identifies the actual
+  source in the data. If every provider fails, throws a new `FallbackProviderError`
+  (code `ALL_PROVIDERS_FAILED`) carrying every individual error in an `errors` array
+  (same order as the provider list) and a message joining all of their `.message`s —
+  nothing from an earlier failure is swallowed once a later one also fails.
+- **`packages/market-data/src/index.ts`** — exports both new modules.
+- **`packages/market-data/src/__tests__/chartGoldPriceProvider.test.ts`** (8 tests) and
+  **`fallbackProvider.test.ts`** (3 tests) — mocked-`fetch` style matching
+  `binanceProvider.test.ts`/`oandaProvider.test.ts` exactly. Covers: successful parse,
+  HTTP error, missing/non-numeric `troy_ounce`, missing `updated_at`, stale `updated_at`
+  (>15 min), and the 15-minute boundary itself (exactly 15 min old still accepted) for
+  the new provider; primary-succeeds-fallback-never-called (asserted via
+  `expect(secondary.getPrice).not.toHaveBeenCalled()`, not just the returned value),
+  primary-fails-secondary-succeeds (asserts the failure was logged), and
+  both-fail-aggregate-contains-both (asserts `.errors` holds both original `Error`
+  instances and the message contains both) for the fallback wrapper.
+- **`supabase/functions/tick/index.ts`** — `buildBinanceProvider()` replaced with
+  `buildFallbackProvider()`, returning
+  `new FallbackMarketDataProvider([new ChartGoldPriceProvider(), new BinanceProvider()])`.
+  `BinanceProvider` itself: byte-for-byte unchanged, still the safety net, not replaced.
+  The catch block's error-message formatting (previously a single
+  `instanceof BinanceProviderError` check) is generalized into a new
+  `describeProviderError` helper that also recognizes `ChartGoldPriceProviderError`, and
+  a `FallbackProviderError` branch that unwraps `.errors` into the logged reason instead
+  of collapsing an aggregate failure into an opaque top-level message. Top-of-file
+  comments updated to describe the new primary/fallback behavior instead of only
+  Binance.
+- **`README.md`**'s COST/FREE TIER section — new `chartgoldprice.com` entry (same
+  four-part format as the existing entries: free tier characteristics, what happens if
+  it fails/degrades, potential paid cost, alternative) placed before the existing
+  Binance entry; the Binance entry itself updated to describe its new role as automatic
+  fallback rather than sole source.
+
+**Builder-level decisions (flagged in the Builder Plan before building, not silently
+decided):** the aggregate-error shape (`FallbackProviderError` with a `code` + `errors`
+array, chosen over native `AggregateError` to match this codebase's existing
+`<Provider>Error`-with-`code` convention); `provider.constructor.name` for the
+fallback's log label (no interface change); `"CHARTGOLDPRICE"` as the new
+`PriceUpdate.provider` value (matches the existing `"BINANCE"`/`"OANDA"` convention).
+
+**Verification:**
+
+- `pnpm --filter @tradeflow/market-data test` — 23/23 pass (up from 12: 6 existing
+  Binance + 6 existing OANDA + 8 new ChartGoldPrice + 3 new Fallback).
+- `pnpm build` / `pnpm test` / `pnpm typecheck` at repo root — all green, no
+  regressions. Full workspace count: 92 tests across `@tradeflow/validation` (37),
+  `@tradeflow/alert-engine` (32), `@tradeflow/market-data` (23); `web`'s Next.js
+  production build compiles and typechecks; 8/8 packages typecheck clean.
+- `deno check supabase/functions/tick/index.ts` (from `supabase/functions/`) — clean,
+  no errors.
+- **Live smoke test**: unlike Arch's local network (which cannot resolve
+  `www.chartgoldprice.com` via corporate DNS — a confirmed local quirk, not a dead
+  site, per the brief), this session's environment resolved and reached the real
+  endpoint fine. `curl https://www.chartgoldprice.com/api/data` returned HTTP 200 with
+  a body matching the brief's documented shape exactly —
+  `meta.updated_at`/`prices.gold.troy_ounce` present and correctly typed, confirming
+  the field names were not guessed and the provider's parsing logic is correct against
+  a real response.
+- **Real finding from the live smoke test, reported rather than worked around**: at
+  the time of this smoke test (2026-09-11T00:46 UTC), the live response's
+  `meta.updated_at` was `2026-09-10T10:29:16.944Z` — roughly 14 hours old, well past
+  the 15-minute staleness threshold. This means `ChartGoldPriceProvider` would
+  currently throw `STALE_DATA` in production right now and `FallbackMarketDataProvider`
+  would fall through to Binance on every tick, until chartgoldprice.com's own feed
+  updates again. This is not a bug in this step's code — it's a live illustration of
+  exactly the risk the brief flagged (no named operator, no SLA, "refreshes on a
+  schedule" with no documented interval guarantee) and exactly why the fallback exists.
+  Flagged for Arch/owner awareness: once deployed, the tick function's response summary
+  and Supabase logs should be checked post-deploy to see which provider is actually
+  serving ticks in practice, since chartgoldprice.com may be staler than expected at
+  least some of the time.
+
+**Not yet deployed**: this step's changes (`supabase/functions/tick/index.ts` plus the
+new `packages/market-data` files) are local-only, pending review — `supabase functions
+deploy` needed after review clears, same gating as every prior step.
+
+**Richard's review (2026-09-11) — Should Fix items addressed, both inline (under 5
+minutes each, per BUILDER.md):**
+
+- **`packages/market-data/src/chartGoldPriceProvider.ts:88,97`** — `this.fetchFn(url)`
+  and `response.json()` are now each wrapped in their own `try/catch`. A thrown
+  network-level error (e.g. DNS failure, connection reset) or a non-JSON response body
+  now surfaces as a typed `ChartGoldPriceProviderError` with a new `NETWORK_ERROR` code
+  (added to the `ChartGoldPriceProviderErrorCode` union) instead of an untyped error
+  escaping — the original error's message is folded into the new error's message for
+  debugging. The existing `HTTP_ERROR` check (`!response.ok`) sits untouched between the
+  two new try/catch blocks. `FallbackMarketDataProvider`'s behavior is unchanged (it
+  already caught untyped errors too), and `tick/index.ts`'s `describeProviderError`
+  needed no change — it already branches on `instanceof ChartGoldPriceProviderError`
+  and reads `.code`/`.message` generically, not on specific code values, so the new code
+  is picked up automatically.
+- **`packages/market-data/src/chartGoldPriceProvider.ts:130`** — the returned
+  `PriceUpdate.timestamp` now uses `this.now().toISOString()` instead of
+  `new Date().toISOString()`, consistent with the staleness check's use of the same
+  injected clock. No behavior change in production (both were real wall-clock time
+  either way); makes the `now` injection point fully deterministic for tests.
+- **Tests added** (`packages/market-data/src/__tests__/chartGoldPriceProvider.test.ts`,
+  now 10 tests, was 8): one asserting `NETWORK_ERROR` when `fetchFn` rejects, one
+  asserting `NETWORK_ERROR` on a non-JSON response body. Strengthened the existing
+  successful-parse test to assert `result.timestamp` equals the injected `now` exactly
+  (`NOW.toISOString()`), not just "doesn't throw when parsed" — this is the concrete
+  test the Should Fix note said "none of the current tests need" but is now trivial to
+  assert given the fix.
+- **Verification re-run after the fix**: `pnpm --filter @tradeflow/market-data test` —
+  25/25 pass (up from 23). `pnpm build`/`pnpm test`/`pnpm typecheck` at repo root — all
+  green, no regressions (94 tests total: 37 validation, 32 alert-engine, 25
+  market-data; 8/8 packages typecheck; `web` production build compiles). `deno check
+  tick/index.ts` — clean. No file outside `chartGoldPriceProvider.ts` and its test file
+  needed changes — `describeProviderError` and `FallbackMarketDataProvider` already
+  handle the new code generically, as expected.
 
 ### Step 6 — Reliability hardening: unchecked DB writes risk duplicate notifications — Status: code-complete, verified locally against a real forced-failure scenario, awaiting review; NOT yet deployed to the live project
 *Date: 2026-09-02. Background run per Arch's dispatch. Reliability fix found during a deliberate hardening audit, not owner-reported — see `handoff/ARCHITECT-BRIEF.md`'s Step 6 for full writeup. Builder Plan recorded in the brief's Builder Plan section before building; proceeded directly (background run) rather than waiting for a synchronous approval round-trip, matching the Step 5 precedent.*
@@ -751,6 +881,15 @@ Once the owner hands over the Supabase project URL and anon key, the remaining D
 - **KG-10** — Two more test users (`e2e-<timestamp>@example.com`, `e2e-reminder-<timestamp>@example.com`) were created in the **real** cloud Supabase project while re-running the existing Step 3 Playwright specs to verify Step 4's fix. Same shape as KG-6/KG-9: harmless, `price_alerts`/`graph_reminders` rows self-deleted by the specs, only `auth.users` rows remain, no service-role key in this session to clean up. Owner/Arch can delete via the Supabase Auth dashboard. — logged 2026-08-31
 - **KG-11** — Step 4's fix is not yet live on the production Cloudflare deployment (see "Pending deploy" above) — this session had no `wrangler deploy` credentials. Until Arch redeploys, `https://tradeflow-web.garychanjiayik.workers.dev/dashboard/alerts/new` and `/dashboard/reminders/new` remain unauthenticated-accessible in production, same as when Arch's brief found them. Fix is code-complete and verified against a local production build; only the deploy step remains, same constraint as Step 3's UI. — logged 2026-08-31
 - **KG-12** — Step 5's migration (`supabase/migrations/0004_reminder_window.sql`, adding `window_start_time`/`window_end_time` to `graph_reminders`) is written but **not applied** to the live Supabase project — same `supabase db push` network block as KG-8. Verified only against a throwaway local `supabase start`/`db reset` Docker stack (torn down after; no real project touched). Until Arch applies this DDL via the dashboard SQL Editor: (a) the live `graph_reminders` table has no window columns, so creating/editing a reminder with a market-open/close window set would fail with a PostgREST "column does not exist" error against production, and (b) Step 5's Build Order step 6 (live verification of the windowed schedule + display fix) cannot be performed. The display-only bug fix (`reminders/page.tsx`'s `formatDate` timezone fix) does not depend on this migration and could be deployed/verified independently if desired. — logged 2026-09-01
+- **KG-15** — Step 7's live smoke test (2026-09-11T00:46 UTC) found chartgoldprice.com's
+  real response currently `meta.updated_at`-stale by this step's own 15-minute
+  threshold (~14 hours old at test time), meaning `ChartGoldPriceProvider` would throw
+  `STALE_DATA` on every tick right now and `FallbackMarketDataProvider` would fall
+  through to Binance every time, not just occasionally. Not a code defect — this is the
+  exact risk the Step 7 brief flagged (no named operator/SLA) — but worth confirming
+  post-deploy which provider is actually serving ticks in practice via the tick
+  function's Supabase logs/response summary, in case chartgoldprice.com turns out to be
+  stale more often than the brief's research suggested. — logged 2026-09-11
 
 ---
 

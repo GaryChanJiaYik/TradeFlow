@@ -1,18 +1,22 @@
 // TradeFlow — "tick" Edge Function (Deno). Invoked every 2 minutes by
 // pg_cron (see supabase/migrations/0003_cron.sql) via pg_net. Per
-// invocation: fetches the latest XAUUSD price from Binance's public PAXG/USDT
-// ticker, evaluates it against every enabled/unexpired price_alerts row,
-// evaluates due graph_reminders, sends Web Push notifications for anything
-// that fires, and unconditionally updates instruments.last_price/last_price_at.
+// invocation: fetches the latest XAUUSD price — primary source
+// chartgoldprice.com's real spot-gold feed, falling back automatically to
+// Binance's public PAXG/USDT ticker if the primary fails or returns stale
+// data (see handoff/ARCHITECT-BRIEF.md's Step 7) — evaluates it against
+// every enabled/unexpired price_alerts row, evaluates due graph_reminders,
+// sends Web Push notifications for anything that fires, and unconditionally
+// updates instruments.last_price/last_price_at.
 //
 // Uses the Supabase **service role** client — this is the one place
 // service-role access is needed, since there's no logged-in user in a cron
 // context and RLS is bypassed by design here (see
 // handoff/ARCHITECT-BRIEF.md Step 2 Decisions).
 //
-// evaluatePriceAlert, computeNextTriggerAt, and BinanceProvider are imported
-// via a *relative filesystem path* into the TS source of packages/alert-engine
-// and packages/market-data, not the @tradeflow/* workspace specifiers — Deno
+// evaluatePriceAlert, computeNextTriggerAt, and the market-data providers are
+// imported via a *relative filesystem path* into the TS source of
+// packages/alert-engine and packages/market-data, not the @tradeflow/*
+// workspace specifiers — Deno
 // executes TypeScript directly and doesn't need node_modules resolution
 // for relative imports, so no esbuild/bundling step is needed. This keeps
 // the tested, reviewed logic as the single source of truth instead of
@@ -26,6 +30,14 @@ import {
   type EvaluableAlert,
 } from "../../../packages/alert-engine/src/evaluatePriceAlert.ts";
 import { BinanceProvider, BinanceProviderError } from "../../../packages/market-data/src/binanceProvider.ts";
+import {
+  ChartGoldPriceProvider,
+  ChartGoldPriceProviderError,
+} from "../../../packages/market-data/src/chartGoldPriceProvider.ts";
+import {
+  FallbackMarketDataProvider,
+  FallbackProviderError,
+} from "../../../packages/market-data/src/fallbackProvider.ts";
 import { computeNextTriggerAt } from "../../../packages/alert-engine/src/computeNextTriggerAt.ts";
 
 const XAUUSD_SYMBOL = "XAUUSD";
@@ -65,17 +77,35 @@ function buildReminderWindowArg(
   };
 }
 
+/**
+ * Formats one provider-level error for the tick response summary. Handles
+ * both typed provider errors (with a `.code`) and anything else that
+ * bubbled up unexpectedly, so a real failure always logs something
+ * actionable instead of an opaque `[object Object]`. Step 7.
+ */
+function describeProviderError(err: unknown): string {
+  if (err instanceof ChartGoldPriceProviderError || err instanceof BinanceProviderError) {
+    return `${err.code}: ${err.message}`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
 function getRequiredEnv(name: string): string {
   const value = Deno.env.get(name);
   if (!value) throw new Error(`Missing required env var: ${name}`);
   return value;
 }
 
-function buildBinanceProvider(): BinanceProvider {
-  // Binance's public ticker endpoint is keyless — no env vars needed. See
-  // handoff/ARCHITECT-BRIEF.md's Step 2 revision for why this replaced
-  // OANDAProvider (which stays in the codebase, unused, for a future swap).
-  return new BinanceProvider();
+/**
+ * Step 7: primary/fallback pair for XAUUSD. ChartGoldPriceProvider (real
+ * spot gold, keyless, no documented rate limit, but no named operator or
+ * SLA) is tried first; BinanceProvider (PAXG/USDT, already proven live in
+ * production) is the automatic fallback if it fails or returns stale data.
+ * Both are keyless — no env vars needed. See
+ * handoff/ARCHITECT-BRIEF.md's Step 7 Decisions.
+ */
+function buildFallbackProvider(): FallbackMarketDataProvider {
+  return new FallbackMarketDataProvider([new ChartGoldPriceProvider(), new BinanceProvider()]);
 }
 
 function configureWebPush(): void {
@@ -344,7 +374,7 @@ Deno.serve(async (_req: Request) => {
     summary.priceAlerts = { skipped: true, reason: "XAUUSD instrument not found or disabled" };
   } else {
     try {
-      const provider = buildBinanceProvider();
+      const provider = buildFallbackProvider();
       const tick = await provider.getPrice(instrument.symbol);
 
       summary.priceAlerts = await processPriceAlerts(supabase, instrument, tick.price, now);
@@ -361,8 +391,18 @@ Deno.serve(async (_req: Request) => {
         console.error(`Failed to update instrument ${instrument.id} last_price:`, instrumentUpdateError);
       }
     } catch (err) {
-      const reason = err instanceof BinanceProviderError ? `${err.code}: ${err.message}` : String(err);
-      console.error("Binance price fetch failed:", reason);
+      // FallbackMarketDataProvider already console.error-logs each individual
+      // provider's failure as it happens (see fallbackProvider.ts); this only
+      // needs to summarize what ultimately reached the tick's response. A
+      // FallbackProviderError means every provider failed — its `.errors`
+      // holds each one's detail, unwrapped here instead of collapsed into an
+      // opaque top-level message. Chart/BinanceProviderError also handled
+      // directly in case a caller bypasses the fallback wrapper in the future.
+      const reason =
+        err instanceof FallbackProviderError
+          ? `${err.code}: ${err.errors.map((e) => describeProviderError(e)).join("; ")}`
+          : describeProviderError(err);
+      console.error("XAUUSD price fetch failed:", reason);
       summary.priceAlerts = { skipped: true, reason };
     }
   }
