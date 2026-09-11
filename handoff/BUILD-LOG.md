@@ -5,7 +5,7 @@
 
 ## Current Status
 
-**Active step:** Step 8 CLEAR (Richard's round 2: "Step 8 is clear"). Not yet deployed/committed.
+**Active step:** Step 8 DEPLOYED AND VERIFIED LIVE — 2026-09-11.
 **Last cleared:** Step 8 — 2026-09-11.
 **Blocked on:** nothing currently.
 
@@ -16,7 +16,7 @@
 ### Known Gaps (added from Step 6's review)
 - **KG-13** — Step 6's duplicate-notification fix was proven via a genuine forced-failure test (REVOKE privileges on a local stack) but that test isn't committed as an automated regression check, so the proof isn't repeatable in CI. A lightweight mocked-Supabase-client unit test would close this; deferred as non-blocking (would mean introducing new test infrastructure for a file that currently has none, contrary to Step 6's own scoping).
 - **KG-14** — Of Step 6's three lower-severity error-checked writes, only the two duplicate-risk paths were independently force-failed and verified; the device-disable and `instruments.last_price` writes were verified by code-pattern inspection only (same shape as the verified ones), not independently forced. Low risk, logged for completeness.
-**Pending deploy:** Steps 6 AND 7's `tick/index.ts` changes are LOCAL ONLY — not yet redeployed via `supabase functions deploy`. Steps 1-5 LIVE as of 2026-09-02. Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix), 2c253d8 (Step 3), 0f21a9e (Step 4), 925a612 (Step 5), 49e6b74 (Step 6). Step 7 not yet committed. **Step 8 (new: `tick-fast` function + narrowed `tick` + `0005_tick_fast_cron.sql`) is also LOCAL ONLY** — not committed, not deployed, and its migration not applied to the live project (needs the same manual dashboard SQL Editor path as `0003_cron.sql`/`0004_reminder_window.sql`, per KG-8). `tick-fast` must be deployed and its `tick_fast_function_url` Vault secret created before its cron job (once applied) can succeed.
+**Pending deploy:** Steps 1-7 LIVE (Steps 1-5 as of 2026-09-02; Step 6+7's `tick/index.ts` redeployed and confirmed healthy per commit 65549e8). Local git commits: 766bc6c, eae9166, 461634e (Step 1), 0df58cd, 01b4719 (Step 2), c227b97, cc6bfba (Step 2 revision), 060cdca (Cloudflare deploy fix), 2c253d8 (Step 3), 0f21a9e (Step 4), 925a612 (Step 5), 49e6b74 (Step 6), 136a76e (Step 7), 036a741 (Step 8). **Step 8 is now LIVE and verified** — `tick-fast` deployed (Edge Function `ACTIVE`, version 1) and `tick` redeployed (version 7, narrowed); `0005_tick_fast_cron.sql` applied manually via the dashboard SQL Editor (`tick_fast_function_url` Vault secret created, reusing existing `tick_function_service_role_key`). Verified live 2026-09-11 07:50 UTC: `cron.job` shows `tick-fast-every-10-seconds` active on schedule `'10 seconds'`; `cron.job_run_details` shows 10 consecutive runs exactly 10s apart, all `status: succeeded`, each returning `1 row`; `instruments.last_price_at` for XAUUSD observed advancing in step with the cron cadence (last_price 4346.97 at 07:50:53.411 UTC, ~20s after the last logged run, consistent with two further successful ticks). No `graph_reminders`/`instruments` write-ownership regression reported.
 
 ### Milestone 1 Proof — 2026-08-31
 
