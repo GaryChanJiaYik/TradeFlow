@@ -4,167 +4,192 @@
 
 ---
 
-## Step 7 — ChartGoldPriceProvider as primary XAUUSD source, Binance as automatic fallback
+## Step 8 — Fast Binance-driven price-alert polling (10s), chartgoldprice demoted to accuracy check
 
-Owner researched alternative free gold-price APIs. Two of four candidates checked out
-as dead/blocked, one (`xaus.com`) turned out to just resell `gold-api.com`, one
-(`goldprice.dev`) is real but capped at 1,000 calls/month (far too low for our ~21,600/
-month 2-minute-poll volume). The remaining candidate, `chartgoldprice.com`, checked
-out: confirmed live (price genuinely updates), no documented rate limit (survived a
-10-request burst with no throttling), CORS-enabled, free with attribution only (no
-API key, no payment). It has no named operator and no SLA ("as is, as available," no
-uptime guarantee in its terms) — real risk it could degrade or disappear without
-notice, which is exactly why this step adds it as **primary with automatic fallback
-to the already-proven Binance PAXG feed**, not a hard swap.
+Owner missed a real XAUUSD alert: price crossed the target and reverted within a
+single 2-minute poll window. Root cause: `chartgoldprice.com` (Step 7's primary
+source) only refreshes its own upstream data roughly once every 60 seconds — this
+was independently reconfirmed against two more candidates the owner proposed
+(`goldprice.dev`, `goldpricez.com`), both also capped near 60s or worse. Across 7
+gold-price aggregators checked total in this project, every verifiable one caps out
+around 60-second freshness — a structural property of that category of service.
+Binance's PAXG ticker remains the only source that has ever demonstrated genuinely
+continuous (per-trade) updates, which is why it's the one being polled faster, not
+any aggregator. Confirmed technically: Supabase's cron scheduler supports a
+`'N seconds'` schedule string (distinct from standard cron's 1-minute floor), making
+10-second polling possible without an always-on server.
+
+Full reasoning and confirmed decisions are in the approved plan; this brief is the
+buildable version of that plan. Read the plan file if you want the full narrative:
+`C:\Users\jychan\.claude\plans\this-is-my-project-nifty-mist.md` (optional — this
+brief already contains what you need to build).
 
 ### Decisions
 
-- **New `ChartGoldPriceProvider`** (`packages/market-data/src/chartGoldPriceProvider.ts`):
-  implements `MarketDataProvider` via `GET https://www.chartgoldprice.com/api/data`
-  (no auth, no key). Response shape:
-  `{"meta":{"updated_at":"<ISO 8601>", ...},"prices":{"gold":{"symbol":"XAU","troy_ounce":<number>, ...}, ...}}`
-  — parse `prices.gold.troy_ounce` as the price. **Staleness check**: also parse
-  `meta.updated_at`; if it's more than 15 minutes older than "now" at call time, treat
-  this as a provider failure (throw a typed error) rather than returning a stale price
-  — this service says it refreshes "on a schedule" with no documented interval
-  guarantee, so don't trust an old value silently. Mirror `BinanceProviderError`'s
-  pattern exactly: a typed `ChartGoldPriceProviderError` with a `code` (e.g.
-  `HTTP_ERROR`, `INVALID_PRICE`, `STALE_DATA`), never returns `NaN`, never silently
-  swallows a bad response.
-- **New `FallbackMarketDataProvider`** (`packages/market-data/src/fallbackProvider.ts`):
-  implements `MarketDataProvider`, constructed with an ordered array of providers
-  (`new FallbackMarketDataProvider([chartGoldPriceProvider, binanceProvider])`).
-  `getPrice(instrument)` tries each provider in order; on any thrown error, logs which
-  provider failed and why (`console.error` — this runs inside the `tick` function, so
-  it surfaces in Supabase's function logs) and tries the next; returns the first
-  success as-is (the winning provider's own `PriceUpdate.provider` field is preserved,
-  so it's always clear from the data itself which source actually supplied a given
-  tick). If every provider fails, throw an aggregate error containing all of their
-  individual errors (don't swallow the earlier failures' detail).
-- **Wire into `supabase/functions/tick/index.ts`**: replace the direct
-  `buildBinanceProvider()` call with a `buildFallbackProvider()` that constructs
-  `new FallbackMarketDataProvider([new ChartGoldPriceProvider(), new BinanceProvider()])`.
-  `BinanceProvider` stays exactly as-is, unchanged, still no credentials needed.
-- **Local network note, so you don't waste time chasing a false alarm**: this owner's
-  local dev network fails to resolve `www.chartgoldprice.com` via its corporate DNS
-  server (confirmed: the apex domain and `drhint.com` resolve fine, but this one
-  subdomain specifically doesn't, via that one DNS server — a local quirk, not a dead
-  site; confirmed working via Google DNS / `curl --resolve`). This should not affect
-  Supabase's Edge Function runtime (different infrastructure, different DNS). You
-  don't need live network access to `chartgoldprice.com` to build or test this
-  provider correctly anyway — test with a mocked `fetch`, exactly like
-  `binanceProvider.test.ts`/`oandaProvider.test.ts` already do. If you want to
-  smoke-test against the real endpoint and hit the same local DNS gap, that's expected
-  here, not a sign anything is broken — note it and move on, don't debug the DNS.
-- **Docs**: add a `chartgoldprice.com` entry to `README.md`'s COST/FREE TIER section
-  (purpose, free-tier characteristics — no documented limit but no SLA/named operator,
-  what happens if it fails — automatic fallback to Binance, already covered above).
+- **Two Edge Functions, not one with a branching flag** (reasoning: keeps every edit
+  to the new hot path out of the same file as Step 6/7's already-reviewed reminder
+  and hardening logic; gives separate per-function invocation/duration metrics for
+  two very different volume profiles; allows independent tuning/rollback of the 10s
+  path). Do not collapse these into one function.
+- **`supabase/functions/tick-fast/index.ts`** (new): `new BinanceProvider().getPrice("XAUUSD")`
+  directly — no `FallbackMarketDataProvider`, chartgoldprice never touched here. Move
+  `processPriceAlerts` here **verbatim**, including Step 6's confirm-write-before-push
+  ordering — do not weaken or reorder that hardening while moving it. Unconditionally
+  update `instruments.last_price`/`last_price_at` on a successful Binance fetch — this
+  function becomes the **sole writer** of that baseline going forward. Never reads or
+  writes `graph_reminders`. On Binance failure: log and skip (self-corrects in 10s,
+  no fallback needed).
+- **`supabase/functions/tick/index.ts`** (narrowed, cron cadence unchanged at 2min):
+  keep `processGraphReminders` **verbatim** — this is a regression-sensitive move, not
+  a rewrite. Delete the current price-alert/fallback block entirely (including the
+  `instruments` update call — this file must stop writing that baseline). Add
+  `checkChartGoldPriceAccuracy`: `new ChartGoldPriceProvider().getPrice(...)`,
+  **read-only** select of `instruments.last_price`/`last_price_at` (never update),
+  compute and `console.log` the delta (absolute and %) between chartgoldprice and the
+  Binance baseline — `console.log`, not `console.error`, this is routine observability
+  not a failure. Surface it in the returned `summary.chartGoldPriceCheck`, matching
+  the file's existing summary-shape convention. On failure or a null baseline (no
+  `tick-fast` run yet): `{ skipped: true, reason }`, same pattern as today's other
+  skip branches. `FallbackMarketDataProvider` becomes unused by any production path
+  after this — leave it in place (still tested/exported), do not delete it.
+- **`supabase/functions/_shared/notifications.ts`** (new): extract
+  `getRequiredEnv`, `configureWebPush`, `PushResult`, `pushToUserDevices`,
+  `logNotification`, `describeProviderError` from current `tick/index.ts`
+  **byte-for-byte** — a mechanical move, not a rewrite, so it's reviewable as a pure
+  diff. Both functions import from here instead of each having their own copy.
+- **`supabase/migrations/0005_tick_fast_cron.sql`** (new): `cron.schedule('tick-fast-every-10-seconds',
+  '10 seconds', $$ ... $$)`, body mirroring `0003_cron.sql`'s `net.http_post` structure.
+  New Vault secret name: `tick_fast_function_url`. **Reuse** the existing
+  `tick_function_service_role_key` Vault secret for the bearer token — do not create a
+  second copy of the same credential. Include a comment documenting the one-time
+  `vault.create_secret(...)` call for the URL that Arch runs manually post-deploy (same
+  pattern as `0003_cron.sql`), and a documented `cron.unschedule(...)` rollback line.
+  State explicitly in a comment that the existing `tick-every-2-minutes` job (job id 1)
+  needs no changes — only the code behind its URL changes.
+- **You cannot run `supabase db push` from this network** (blocks direct Postgres
+  connections, per KG-8) — write the migration file, but Arch applies it manually via
+  the dashboard SQL Editor after review. **Verify the `'10 seconds'` cron syntax
+  actually registers against a local `supabase start` stack before considering this
+  done** — this is the single riskiest unverified assumption in the whole step,
+  matching how `0003_cron.sql` was verified locally before ever reaching production.
 
 ### Build Order
-1. `ChartGoldPriceProvider` + unit tests (mocked `fetch`): successful parse, HTTP
-   error, malformed/missing `troy_ounce`, stale `updated_at` (>15 min old).
-2. `FallbackMarketDataProvider` + unit tests: primary succeeds (fallback never called —
-   assert this, not just that the right value comes back); primary throws, fallback
-   succeeds; both throw (assert the aggregate error contains both underlying errors).
-3. Wire into `tick/index.ts`.
-4. README update.
-5. Verify: `pnpm build`/`test`/`typecheck`, `deno check`. If you have working network
-   access to `chartgoldprice.com` in your environment, do one live smoke-test call
-   confirming a real parse; if you hit the same local DNS gap Arch hit, that's fine,
-   the mocked-fetch tests are the real verification here.
+1. `_shared/notifications.ts` extraction (mechanical move).
+2. `tick-fast/index.ts` — build, then verify locally against a throwaway `supabase start`
+   stack with real Binance access: `instruments.last_price` updates each call, a real
+   crossing fires correctly, `graph_reminders` provably untouched (diff before/after).
+3. Narrow `tick/index.ts` — verify locally: reminders still process correctly, the
+   chartgoldprice log line shows a plausible delta, and `instruments.last_price` is
+   provably **unchanged** by this invocation (read before/after — this is the one
+   thing that must not regress).
+4. `0005_tick_fast_cron.sql` — verify the `'10 seconds'` schedule syntax registers
+   locally before finalizing the file.
+5. `handoff/BUILD-LOG.md` entry per this project's established process.
 
 ### Flags
-- Flag: Keep `BinanceProvider` completely unchanged — it's the safety net, not being
-  replaced.
-- Flag: Do not guess `chartgoldprice.com`'s exact response field names — the shape
-  above is confirmed from a real response Arch captured; if your own test call
-  returns something different, treat that as a real finding to report, not something
-  to silently work around.
-- Flag: The staleness threshold (15 minutes) is Arch's judgment call, generous
-  relative to our 2-minute poll interval — if you have a reason to pick a different
-  number, say so rather than silently changing it.
+- Flag: Do not let `processGraphReminders` or Step 6's write-before-push ordering
+  drift while moving/editing code around them — these are regression-sensitive,
+  already-proven-in-production pieces of logic.
+- Flag: `tick-fast` must never call `FallbackMarketDataProvider` or touch
+  chartgoldprice in any way — keeping it to one direct provider call is deliberate,
+  to keep typical duration well under the 10s cadence (see the plan's overlapping-
+  invocation risk discussion — no advisory-lock guard is being added preemptively).
+- Flag: Do not invent a new table/log for the chartgoldprice accuracy check —
+  `console.log` + the response summary is sufficient, per the plan.
 
 ### Definition of Done
-- [ ] `pnpm build`, `pnpm test`, `pnpm typecheck` pass, including new provider and
-      fallback-wrapper tests.
-- [ ] `deno check supabase/functions/tick/index.ts` clean.
-- [ ] Fallback behavior proven via tests: primary-success, primary-fail-secondary-
-      succeeds, and both-fail paths all covered, not just the happy path.
-- [ ] README documents the new provider per spec section 37's format.
+- [ ] `deno check` clean on both `tick/index.ts` and `tick-fast/index.ts`.
+- [ ] `pnpm build`/`test`/`typecheck` pass (no-op regression check — no package
+      internals should change).
+- [ ] Local verification of all four points in Build Order steps 2-4 actually
+      performed and documented, not just "code looks right."
+- [ ] Migration file written and locally verified, not yet applied to the live
+      project (Arch does that after review).
 
 ---
 
 ## Builder Plan
 *Builder adds their plan here before building. Architect reviews and approves.*
 
-**Files to add:**
-- `packages/market-data/src/chartGoldPriceProvider.ts` — `ChartGoldPriceProvider` +
-  `ChartGoldPriceProviderError` (codes: `HTTP_ERROR`, `INVALID_PRICE`, `STALE_DATA`),
-  mirroring `binanceProvider.ts`'s shape/style exactly (injectable `fetchFn`, typed
-  error class, never returns `NaN`). Endpoint:
-  `GET https://www.chartgoldprice.com/api/data`. Parses `prices.gold.troy_ounce` as
-  price and `meta.updated_at` for the staleness check (>15 min old at call time ->
-  `STALE_DATA`). `PriceUpdate.provider` will be `"CHARTGOLDPRICE"`.
-- `packages/market-data/src/fallbackProvider.ts` — `FallbackMarketDataProvider` +
-  `FallbackProviderError` (aggregate error, code `ALL_PROVIDERS_FAILED`, carries an
-  `errors: unknown[]` array of every provider's individual thrown error in order).
-  Constructed with an ordered `MarketDataProvider[]`; `getPrice` tries each in order,
-  `console.error`-logs `<ProviderName failed: reason>` per failure (using the
-  provider's own constructor name for the log label since `MarketDataProvider` has no
-  name field), returns the first success untouched. Throws the aggregate only if every
-  provider fails.
-- `packages/market-data/src/__tests__/chartGoldPriceProvider.test.ts` and
-  `fallbackProvider.test.ts`, mirroring `binanceProvider.test.ts`'s mocked-`fetch`
-  style — cases per the brief's Build Order (successful parse, HTTP error, malformed/
-  missing `troy_ounce`, stale `updated_at`; primary-success-fallback-not-called,
-  primary-fail-fallback-succeeds, both-fail-aggregate-contains-both).
-- Export both new modules from `packages/market-data/src/index.ts`.
+**Approach** — five files, in Build Order order:
 
-**Files to change:**
-- `supabase/functions/tick/index.ts` — replace `buildBinanceProvider()` (and its
-  BinanceProvider-only import) with `buildFallbackProvider()` returning
-  `new FallbackMarketDataProvider([new ChartGoldPriceProvider(), new BinanceProvider()])`.
-  The existing catch block's error-message formatting
-  (`err instanceof BinanceProviderError ? ... : String(err)`) will be generalized to
-  also recognize `ChartGoldPriceProviderError` and `FallbackProviderError` (unwrapping
-  the aggregate's inner errors into the logged reason) so a real failure still logs
-  something actionable instead of an opaque `[object Object]`/`Error: ...` string.
-  `BinanceProvider` itself: untouched.
-- `README.md`'s COST/FREE TIER section — new `chartgoldprice.com` entry (same
-  four-part format as the existing Binance/Supabase/Cloudflare entries: free tier
-  characteristics, what happens if it fails, potential paid cost, alternative),
-  and the Binance entry's "Alternative" line gets a one-clause update noting it's now
-  the fallback rather than sole source.
+1. **`supabase/functions/_shared/notifications.ts`** (new) — byte-for-byte cut of
+   `getRequiredEnv`, `configureWebPush`, `PushResult`, `pushToUserDevices`,
+   `logNotification`, `describeProviderError` out of current `tick/index.ts`
+   (lines 86-213 roughly). Only change from a pure copy-paste: add the two
+   `export` keywords each already-top-level function/type needs so both
+   functions can import them, and keep the `ChartGoldPriceProviderError`/
+   `BinanceProviderError` imports `describeProviderError` needs. No logic
+   touched.
+2. **`supabase/functions/tick-fast/index.ts`** (new) — `Deno.serve` handler:
+   read `XAUUSD` instrument, `new BinanceProvider().getPrice("XAUUSD")`
+   directly (no fallback wrapper), run `processPriceAlerts` (moved verbatim
+   from current `tick/index.ts` lines 215-295, including the Step 6
+   confirm-write-before-push ordering — copied unchanged, only its imports
+   adjusted), then unconditionally update `instruments.last_price`/
+   `last_price_at` on a successful fetch. On Binance failure: `console.error`
+   + `summary.priceAlerts = { skipped: true, reason }`, no fallback, no
+   `graph_reminders` access anywhere in this file. Own `deno.json` inherited
+   from the shared one at `supabase/functions/deno.json` (Deno resolves
+   config from the nearest ancestor — same as `tick/`, no new config file
+   needed, verified during build).
+3. **`supabase/functions/tick/index.ts`** (narrowed) — remove
+   `buildFallbackProvider`, `processPriceAlerts`, and the whole "Price tick +
+   price_alerts" block including its `instruments` update call. Keep
+   `processGraphReminders`, `timeStringToMinutes`, `buildReminderWindowArg`
+   verbatim. Add `checkChartGoldPriceAccuracy(supabase)`: calls
+   `new ChartGoldPriceProvider().getPrice("XAUUSD")`, does a read-only
+   `select last_price, last_price_at from instruments where symbol =
+   'XAUUSD'`, computes `delta = chartgoldprice.price - instrument.last_price`
+   (absolute and `%`), `console.log`s it, returns the numbers for
+   `summary.chartGoldPriceCheck`. Null baseline (`last_price === null`, i.e.
+   `tick-fast` hasn't run yet) or either fetch/select failing →
+   `{ skipped: true, reason }`. Imports switch to `_shared/notifications.ts`.
+   `FallbackMarketDataProvider` untouched/unimported here — left as dead-in-
+   production code per the brief, not deleted.
+4. **`supabase/migrations/0005_tick_fast_cron.sql`** (new) — mirrors
+   `0003_cron.sql`'s structure exactly: `cron.schedule('tick-fast-every-10-
+   seconds', '10 seconds', $$ net.http_post(...) $$)`, reading
+   `tick_fast_function_url` (new secret, documented one-time
+   `vault.create_secret` comment, not created here) and the *existing*
+   `tick_function_service_role_key` (reused, not duplicated). Comment stating
+   job id 1 (`tick-every-2-minutes`) needs no changes, plus a documented
+   `select cron.unschedule('tick-fast-every-10-seconds');` rollback line.
+5. Update `handoff/BUILD-LOG.md`.
 
-**Decisions carried from the brief (not re-litigating):** ChartGoldPrice as primary,
-Binance as fallback, unchanged; 15-minute staleness threshold, as specified; response
-field names taken verbatim from the brief, not guessed.
+**Local verification plan** (throwaway `supabase start` via `npx supabase`,
+Docker confirmed running; Deno 2.9.6 and outbound network access to both
+`data-api.binance.vision` and `www.chartgoldprice.com` confirmed reachable
+from this environment):
+- Per KG-5 (Step 2), `supabase functions serve` was previously unreliable on
+  this Windows+Docker setup for functions with relative imports reaching
+  outside `supabase/functions/` — will retest it first, and fall back to the
+  same proven workaround (`deno run` directly against the local stack's
+  `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` from `supabase status -o json`)
+  if it still doesn't work, same as prior steps.
+- Start the stack, apply `0001`-`0004` migrations (already-proven), confirm
+  `instruments.last_price` starts `null`.
+- Run `tick-fast` once for real against live Binance: assert
+  `instruments.last_price`/`last_price_at` updated, `graph_reminders` table
+  row-for-row identical before/after (diff a full select).
+- Seed one `price_alerts` row with a target crafted to be crossed by the next
+  real Binance tick (or seed `instruments.last_price` just below/above the
+  live price first) and confirm it fires exactly once and `last_triggered_at`
+  is set.
+- Run narrowed `tick` once: assert `graph_reminders` due rows still advance
+  `next_trigger_at` and a push/log fires as before; assert
+  `instruments.last_price`/`last_price_at` are byte-identical before/after
+  (read, run, read, diff); assert `summary.chartGoldPriceCheck` logs a
+  plausible delta against the Binance baseline `tick-fast` just wrote.
+- Apply `0005_tick_fast_cron.sql` locally and confirm `select * from
+  cron.job where jobname = 'tick-fast-every-10-seconds'` shows `schedule =
+  '10 seconds'` and the job is active — the specific syntax-registers check
+  the brief calls out as the riskiest assumption.
+- Tear down the local stack afterward (`supabase stop`); no real project
+  touched, consistent with every prior step's local-only verification.
 
-**Builder-level decisions requiring judgment (flagging rather than silently deciding):**
-1. **Aggregate error shape** — no existing convention in this codebase for a
-   multi-error wrapper. Chose a typed `FallbackProviderError extends Error` with a
-   single `code: "ALL_PROVIDERS_FAILED"` and an `errors: unknown[]` property (parallel
-   array to the provider list, same order), message built by joining each error's
-   `.message`. Picked over Node's native `AggregateError` because this codebase
-   otherwise always uses its own `<Provider>Error` classes with a `code` field for
-   `instanceof`-based handling at the call site (see the tick catch block), and Deno's
-   `AggregateError` support/inspection formatting is less predictable than a plain
-   custom class.
-2. **Provider identification in fallback's log line** — `MarketDataProvider` is a bare
-   interface (no `name`/`id` field). Using `provider.constructor.name` (e.g.
-   `"ChartGoldPriceProvider"`, `"BinanceProvider"`) for the `console.error` label
-   rather than adding a new required interface member, to avoid touching the
-   `MarketDataProvider` contract (and thus `OANDAProvider`, unused but still
-   implementing it) for this step.
-3. **`PriceUpdate.provider` string for the new provider** — using `"CHARTGOLDPRICE"`
-   (matches `"BINANCE"`/`"OANDA"`'s all-caps convention already in
-   `packages/types/src/priceUpdate.ts`'s comment and both existing providers).
-4. Per the brief's own note, will not chase the local DNS gap if hit; mocked-fetch
-   tests are the verification bar. Will attempt one live smoke-test call and report
-   the outcome either way.
-
-No deviations from the brief's Decisions/Build Order/Flags otherwise. Proceeding to
-build now (background run, per instruction) — will report any real surprises (e.g. a
-live response shape mismatch) rather than silently working around them.
+**Uncertainties / none blocking** — no ambiguity found in the brief; proceeding
+directly to build per the "background run" instruction rather than waiting
+for interactive Architect sign-off on this plan.
 
 Architect approval: [ ] Approved / [ ] Redirect — see notes below

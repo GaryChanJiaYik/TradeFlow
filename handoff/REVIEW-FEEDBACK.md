@@ -1,175 +1,189 @@
-# Review Feedback — Step 7
+# Review Feedback — Step 8
 Date: 2026-09-11
-Ready for Builder: YES
+Ready for Builder: NO
 
 ## Must Fix
-None.
+
+- `supabase/functions/tick/index.ts:185` — `checkChartGoldPriceAccuracy`'s
+  catch block (covers `ChartGoldPriceProviderError` cases like `STALE_DATA`,
+  plus any other thrown error) logs via `console.log`:
+  ```
+  console.log(`chartgoldprice.com accuracy check skipped: ${reason}`);
+  ```
+  I independently checked this against the file's own established convention
+  before agreeing with Arch, rather than taking the framing on faith. Every
+  other genuine-failure branch in both `tick` and `tick-fast` — including the
+  pre-Step-8 `tick/index.ts`'s old Binance-fetch-failure branch and its
+  `FallbackProviderError` branch (both providers failing, i.e. the *exact
+  same* "expected, non-critical, chartgoldprice-is-stale" scenario this code
+  used to handle before Step 8), plus `tick-fast`'s current
+  `console.error("XAUUSD price fetch (Binance) failed:", ...)` — is logged at
+  `console.error` unconditionally, with no carve-out for "this is an
+  anticipated condition." The pattern in this codebase has never been
+  "expected failures get console.log"; it's "provider/write failures get
+  console.error, successful routine observability gets console.log." This
+  branch is the one place in the new code that breaks that pattern.
+  Practical effect: Supabase's dashboard log filter for error-level entries —
+  the tool the owner would actually use to notice a chartgoldprice problem —
+  will not surface it. Fix: change this one line to `console.error`. The two
+  earlier skip returns in the same function (`instrumentError`/no instrument,
+  and `last_price === null`) correctly log nothing at all, matching the
+  pre-Step-8 file's identical pattern for "instrument not found" — leave
+  those as-is, this is only about the catch block's `console.log`.
 
 ## Should Fix
-[Does not block. Fix inline if under 5 minutes, otherwise log to BUILD-LOG.]
 
-- `packages/market-data/src/chartGoldPriceProvider.ts:88,97` — `this.fetchFn(url)` and
-  `response.json()` are not wrapped in try/catch, so a network-level throw or a
-  non-JSON body would propagate as a raw untyped error instead of a
-  `ChartGoldPriceProviderError`. This does not break correctness — verified
-  `FallbackMarketDataProvider`'s catch is untyped (`catch (err)`) and falls through
-  regardless of error type — but the logged reason for that specific failure mode
-  would be a raw parser exception message instead of a clean, typed one. Cosmetic;
-  log it if not fixed inline.
-- `packages/market-data/src/chartGoldPriceProvider.ts:130` — the returned
-  `PriceUpdate.timestamp` uses `new Date().toISOString()` directly rather than the
-  injectable `this.now()` used for the staleness comparison. No production impact
-  (real clock either way), but it means the `now` injection point isn't fully
-  deterministic for a test that wanted to assert an exact timestamp value. None of
-  the current tests need this, so not blocking.
+- `supabase/functions/tick/index.ts:78-133` (`processGraphReminders`) — Build
+  report claims this was kept "verbatim." Diffed byte-for-byte against its
+  state in `136a76e` (the last commit to touch this file, Step 7) and it is
+  **not** identical: the in-loop comment changed from `// Same ordering
+  requirement as processPriceAlerts: advance` to `// Same ordering
+  requirement as processPriceAlerts (tick-fast): advance`. Zero behavioral
+  difference — `processPriceAlerts` really did move to `tick-fast`, so the
+  parenthetical is accurate — but "verbatim"/"byte-for-byte" was the explicit
+  claim, and this is exactly the kind of drift that claim is supposed to rule
+  out. `timeStringToMinutes`/`buildReminderWindowArg` (lines 63-76) and the
+  function body of `processGraphReminders` itself (the actual logic, lines
+  79-132) diffed clean. Recommend either reverting the parenthetical or
+  correcting the build report's wording from "verbatim" to "logic verbatim,
+  one comment updated for accuracy."
+- `supabase/functions/_shared/notifications.ts:19` (`describeProviderError`)
+  — same category of issue. Build report claims this file is "byte-for-byte
+  extraction... only export keywords added, no logic changed." Diffed clean
+  on `getRequiredEnv`, `configureWebPush`, `PushResult`, `pushToUserDevices`,
+  and `logNotification` (all identical modulo the added `export`), but
+  `describeProviderError`'s doc comment was reworded: "Formats one
+  provider-level error for **the tick response summary**" →  "Formats one
+  provider-level error for **a function's response summary**." Sensible edit
+  (the function now serves two callers, not one), zero logic change, but not
+  literally "only export keywords added" as claimed. Recommend correcting the
+  build report's wording the same way as above.
 
 ## Escalate to Architect
-None. The known chartgoldprice.com staleness situation flagged in the Open
-Questions section (14-hour-old feed at smoke-test time, meaning Binance will serve
-essentially all ticks via fallback until the upstream feed updates) is correctly
-identified by Bob as expected behavior given the design, already logged as KG-15,
-and requires no code change — just post-deploy monitoring, which is Arch/owner's
-job, not a blocker here.
+None.
 
 ## Cleared
 
-**1. Staleness check (`chartGoldPriceProvider.ts`).** Verified line-by-line:
-`updatedAtMs = updatedAt ? Date.parse(updatedAt) : NaN` correctly funnels both a
-missing `meta.updated_at` and an unparsable one into the same `Number.isFinite`
-guard, which throws a typed `STALE_DATA` error rather than silently treating a
-missing timestamp as fresh. Comparison direction (`ageMs = now - updatedAtMs`,
-`ageMs > threshold`) is correct — confirmed against the test at line 78-86 (16 min
-old → stale) and the boundary test at line 88-95 (exactly 15 min → not stale, since
-`>` not `>=`, matching the "more than 15 minutes" doc comment). Traced every
-malformed-response path by hand and confirmed none can return NaN: HTTP error →
-throw before parsing; missing/non-numeric `troy_ounce` → caught by
-`Number.isFinite(price)` (this also correctly rejects strings, null, and objects,
-not just NaN) → `INVALID_PRICE`; missing/malformed `updated_at` → `STALE_DATA`. All
-four cases have a matching real test with a real `instanceof`/`.code` assertion, not
-just "doesn't throw."
+**1. `processPriceAlerts` in `tick-fast/index.ts` (lines 44-124).** Diffed
+byte-for-byte against its exact location in the pre-Step-8 `tick/index.ts`
+(commit `136a76e`, lines 215-293): identical, including Step 6's
+confirm-write-before-push ordering. Read the block in full independent of the
+diff: the `price_alerts` update (`.update(update).eq("id", alert.id)`) is
+awaited, `updateError` is checked, and on error the loop `continue`s before
+reaching the `pushToUserDevices`/`logNotification` calls — there is no
+fall-through path from a failed update to a push. Step 6's hardening is
+genuinely intact in the new hot path, not just copy-pasted with the ordering
+subtly reshuffled.
 
-**2. FallbackMarketDataProvider (`fallbackProvider.ts`).** Confirmed the `for`
-loop tries providers strictly in the constructor-supplied order, each iteration
-wrapped in its own try/catch so one provider's rejection cannot prevent the next
-from being tried, and every failure is both logged individually
-(`console.error`) and pushed to an `errors` array. Confirmed the aggregate
-`FallbackProviderError` thrown only when the loop exhausts contains every
-individual error — both in `.errors` (array, in order) and folded into
-`.message` — not just the last one; the "both fail" test asserts
-`errors` equals `[primaryError, secondaryError]` and the message contains both
-error strings. Traced the exact production scenario (ChartGoldPriceProvider
-throws `STALE_DATA`, BinanceProvider succeeds): the success path is
-`return await provider.getPrice(instrument)` — the winning provider's
-`PriceUpdate` is returned completely untouched, no merging/spreading with the
-failed attempt anywhere in the function. The "falls through to secondary" test
-exercises this exact path and asserts `result.provider === "BINANCE"`, confirming
-the returned data is genuinely Binance's, not corrupted.
+**2. Structural guarantee: `tick-fast` never touches `graph_reminders`.**
+Grepped the full file — the only occurrence of the string is in a top-of-file
+comment describing the guarantee itself; no `.from("graph_reminders")`
+anywhere.
 
-**3. BinanceProvider untouched.** `git status --porcelain` and
-`git diff HEAD -- packages/market-data/src/binanceProvider.ts` both confirm the
-file isn't even part of the working-tree diff — zero changes since the last
-commit that touched it (`c227b97`, Step 2 revision). The already-existing
-`binanceProvider.test.ts` (6 tests) still passes unmodified.
+**3. Structural guarantee: narrowed `tick` never writes `instruments`.**
+Grepped the full file — the only `.from("instruments")` call (line 150) is a
+`.select(...)`; the only `.update(...)` call in the whole file (line 110) is
+on `graph_reminders`, inside `processGraphReminders`. `tick-fast` is
+confirmed the sole writer of `instruments.last_price`/`last_price_at` going
+forward.
 
-**4. New tests exercise all three paths with real assertions.**
-`fallbackProvider.test.ts`'s three tests map exactly to: primary succeeds →
-fallback never invoked (asserts `secondary.getPrice` not called, and the exact
-`.provider` value returned); primary fails → fallback succeeds (asserts the
-winning `.provider` value, call count, and that the failure was logged); both
-fail → aggregate error (asserts `instanceof`, `.code`, `.errors` array equality
-against the exact original error objects, and message content). None of the
-three rely on a bare "did not throw" — every one asserts specific returned/thrown
-values. `chartGoldPriceProvider.test.ts`'s 8 tests likewise assert `.code` and
-parsed values, not just absence of throw.
+**4. `tick-fast` uses `BinanceProvider` directly, no chartgoldprice in the
+hot path.** Line 25 imports `BinanceProvider` from
+`packages/market-data/src/binanceProvider.ts`; line 152 instantiates it
+directly (`new BinanceProvider()`). No `FallbackMarketDataProvider` or
+`ChartGoldPriceProvider` import or reference anywhere in `tick-fast/index.ts`.
 
-**5. tick/index.ts wiring change is isolated.** Full `git diff HEAD` reviewed:
-every hunk is confined to (a) top-of-file comments, (b) new imports, (c)
-`buildFallbackProvider` replacing `buildBinanceProvider` plus the new
-`describeProviderError` helper, and (d) the price-fetch try/catch's error
-branch, which now unwraps `FallbackProviderError.errors` instead of matching only
-`BinanceProviderError`. No hunk touches `processPriceAlerts`, reminder
-evaluation, or push-notification code — those sections don't appear in the diff
-at all.
+**5. `_shared/notifications.ts` extraction.** Diffed `PushResult`,
+`pushToUserDevices`, and `logNotification` against their pre-Step-8 location
+in `tick/index.ts` (commit `136a76e`) — byte-for-byte identical apart from
+the added `export` keywords. `getRequiredEnv` and `configureWebPush` likewise
+identical. `buildFallbackProvider` (present in the old file, not in the
+shared-helpers list Bob's report names) was correctly dropped rather than
+extracted — it isn't shared logic, it's a Step 7 provider-wiring helper that's
+now unused. Confirmed both `tick/index.ts` and `tick-fast/index.ts` import
+`configureWebPush`/`describeProviderError`/`getRequiredEnv`/
+`logNotification`/`pushToUserDevices` from `../_shared/notifications.ts` — no
+duplicate definitions in either file. (One doc-comment wording exception
+noted under Should Fix above.)
 
-**6. No secrets.** `ChartGoldPriceProvider` reads no env var and needs no key
-(confirmed by reading the full file — constructor only takes injectable
-`fetchFn`/`now`, both defaulted to real globals). `tick/index.ts`'s diff
-introduces no new `Deno.env.get` calls. Consistent with Binance's existing
-keyless pattern.
+**6. `0005_tick_fast_cron.sql`.** The cron job body's bearer token reads
+`vault.decrypted_secrets where name = 'tick_function_service_role_key'` — the
+same secret name `0003_cron.sql` created, not a new/duplicate one. Only a new
+`tick_fast_function_url` secret is introduced, and only via a documented
+one-time `vault.create_secret(...)` comment (not executed by the migration
+itself, consistent with `0003_cron.sql`'s own pattern for its two secrets).
+The file contains exactly one `cron.schedule(...)` call
+(`tick-fast-every-10-seconds`); nothing in the file references job id 1
+(`tick-every-2-minutes`) or calls `cron.unschedule`/`cron.alter_job` against
+it — that job is genuinely left untouched. Rollback line is documented in a
+comment only, not executed.
 
-**Independently re-ran** `pnpm --filter @tradeflow/market-data test`: 23/23 pass
-(4 test files, matching Bob's claim exactly), confirming the numbers in the
-Verification section rather than taking them on faith.
+**7. Build/typecheck/test, re-run independently, not trusted from the
+report.**
+- `deno check --node-modules-dir=auto` clean on all three Deno files:
+  `supabase/functions/tick/index.ts`, `supabase/functions/tick-fast/index.ts`,
+  `supabase/functions/_shared/notifications.ts`. (Plain `deno check` fails in
+  this environment with an npm-resolution error unrelated to Bob's code —
+  `--node-modules-dir=auto` against the existing root `node_modules` resolves
+  it; same result either way once resolvable.)
+- `pnpm typecheck` at repo root: 8/8 tasks pass (cached, no package internals
+  changed by this step — expected, since only `supabase/functions/**` and
+  `supabase/migrations/**` changed).
+- `pnpm build`: 5/5 tasks pass, `web` build compiles and generates all 11
+  pages successfully.
+- `pnpm test`: 6/6 tasks pass, **94/94 tests** (`validation` 37,
+  `market-data` 25, `alert-engine` 32) — matches the build report's claimed
+  count exactly.
 
-Signal to Arch: Step 7 is clear.
+**8. No drift.** Read both new/modified function files in full: nothing
+beyond what the brief and build report describe — no extra endpoints, no
+extra tables touched, no new env vars beyond the two Vault secrets already
+accounted for in the migration.
 
----
+Signal to Arch: Step 8 has one required fix (`console.log` → `console.error`
+at `tick/index.ts:185`, one line, no design decision needed — Arch's call on
+this is correct, verified independently against the codebase's own
+convention) plus two build-report wording corrections (Should Fix). Once the
+one-line fix lands, re-verification is trivial: the same catch block, same
+line — no full re-review needed.
 
-## Round 2 — 2026-09-11
-Date: 2026-09-11
-Ready for Builder: YES (no further action)
+## Round 2 (2026-09-11)
 
-Re-reviewed after Bob's fix for both round-1 Should Fix items. Read
-`chartGoldPriceProvider.ts` and its test file in full; did not re-review the
-staleness/parsing/fallback logic already cleared above.
+Targeted re-verification of the fix round only, per Bob's claims in
+`handoff/REVIEW-REQUEST.md`'s "Fix Round" section. Not a full re-review —
+round 1 already cleared everything else in this step.
 
-**1. Untyped `fetch`/`response.json()` — fixed, verified.** Lines 92-98 wrap
-`this.fetchFn(url)` in try/catch, throwing `ChartGoldPriceProviderError` with the
-new `NETWORK_ERROR` code and the underlying error's message folded in. Lines
-115-121 wrap `response.json()` the same way, same code. `NETWORK_ERROR` is
-correctly added to the `ChartGoldPriceProviderErrorCode` union. Confirmed
-`tick/index.ts`'s `describeProviderError` (line 86-90) and
-`fallbackProvider.ts`'s catch (generic `catch (err)`, untyped, line ~30 area)
-both handle this with no code change: `describeProviderError` only checks
-`instanceof ChartGoldPriceProviderError || instanceof BinanceProviderError` and
-reads `.code`/`.message` generically, never switching on a specific code value —
-so `NETWORK_ERROR` flows through exactly like the pre-existing codes. Bob's claim
-that these two files needed no changes is correct on the merits, not just by
-assertion.
+1. **Must Fix — confirmed fixed, correctly scoped.** Read
+   `checkChartGoldPriceAccuracy` (`supabase/functions/tick/index.ts:146-188`)
+   in full. Line 170 (success-path delta-comparison log, inside the `try`
+   block) is still `console.log`, unchanged — correct, that's routine
+   observability. Line 185, the catch block's skip/failure branch, is now
+   `console.error(\`chartgoldprice.com accuracy check skipped: ${reason}\`)`.
+   The fix touches only that one branch — the two earlier skip returns
+   (`instrumentError`/no instrument at line 157, `last_price === null` at
+   line 160) still log nothing at all, matching the pre-Step-8 pattern, as
+   intended. No collateral changes to the surrounding function.
 
-**2. Timestamp now from injected `now()` — fixed, verified.** The return
-statement uses `this.now().toISOString()`, and the staleness check above it uses
-`this.now().getTime()` — same injected function, both call sites. In the test
-suite `now` is a fixed-value closure (`() => NOW`), so both calls return the
-identical `Date`, and the successful-parse test now asserts
-`result.timestamp === NOW.toISOString()` exactly rather than "didn't throw." No
-inconsistency between the staleness comparison and the returned timestamp is
-possible from this change — they were already reading the same clock, this just
-makes the returned value use it too.
+2. **Re-verification, run independently, not trusted from the report.**
+   - `pnpm test` at repo root: 6/6 tasks pass, 94/94 tests
+     (`validation` 37, `market-data` 25, `alert-engine` 32) — same count as
+     round 1, confirming no test-relevant code changed beyond the one line.
+   - `deno check --node-modules-dir=auto` on `supabase/functions/tick/index.ts`
+     and `supabase/functions/tick-fast/index.ts`: both clean, no errors.
 
-**3. NETWORK_ERROR is genuinely tested.** Two new tests in
-`chartGoldPriceProvider.test.ts`:
-- `"throws ChartGoldPriceProviderError with NETWORK_ERROR when fetch itself rejects"` —
-  `fetchFn` is `vi.fn().mockRejectedValue(new TypeError("fetch failed"))`, a real
-  rejection, not a stub that returns an error object. Asserts `instanceof`,
-  `.code === "NETWORK_ERROR"`, and `.message` contains the underlying error text.
-- `"throws ChartGoldPriceProviderError with NETWORK_ERROR on a non-JSON response body"` —
-  uses a real `Response("<html>not json</html>", ...)`, so `response.json()`
-  genuinely throws a `SyntaxError` when parsing it, not a mocked throw. Asserts
-  `instanceof` and `.code === "NETWORK_ERROR"`.
+3. **Should Fix wording corrections — skimmed, accurate.** Checked
+   `handoff/BUILD-LOG.md` (lines 70, 72, 93) and
+   `handoff/REVIEW-REQUEST.md` (lines 8-9, 37-43, 72-76): both now
+   characterize the `describeProviderError` doc comment and the
+   `processGraphReminders` in-loop comment as "logic verbatim, comment
+   reworded" with explicit "zero logic change" / "zero behavioral
+   difference" language, rather than the original "byte-for-byte"/"verbatim"
+   claims. This matches round 1's actual finding — comment-only drift, no
+   underlying logic touched — and I'm not re-diffing the logic itself here
+   since round 1 already confirmed it clean against `136a76e`.
 
-Both are real fault-injection cases with real assertions, not "doesn't throw"
-placeholders.
-
-**4. `fallbackProvider.ts` / `tick/index.ts` genuinely untouched.** `git status`
-shows the whole Step 7 change is still one uncommitted working-tree diff against
-the Step 6 commit (nothing from Step 7 has been committed yet), so a `git diff`
-alone can't isolate "round-1 state" vs "round-2 fix" by commit boundary. Checked
-two ways instead:
-- File mtimes: `fallbackProvider.ts` (08:24) and `tick/index.ts` (08:26) both
-  predate the round-2 fix work by a wide margin — `chartGoldPriceProvider.ts`
-  itself was last saved at 08:57, its test file at 08:55, matching the fix
-  session. Neither of the two claimed-untouched files was written to during that
-  window.
-- Content check: `describeProviderError` in `tick/index.ts` and the catch in
-  `fallbackProvider.ts` are exactly as described in point 1 above — generic,
-  code-value-agnostic, no `NETWORK_ERROR`-specific branch anywhere in either
-  file. There would be nothing for Bob to add even if he'd wanted to.
-Both confirm Bob's claim.
-
-**5. Test count re-run independently.** `pnpm --filter @tradeflow/market-data test`:
-4 test files, **25/25 pass** — `fallbackProvider.test.ts` (3), 
-`chartGoldPriceProvider.test.ts` (10), `binanceProvider.test.ts` (6),
-`oandaProvider.test.ts` (6). Matches Bob's claimed 25 exactly.
-
-**Verdict: Step 7 is clear.**
+**Verdict: Step 8 is clear.** The one Must Fix is genuinely fixed and
+correctly scoped, both Should Fix items are resolved via accurate wording
+corrections (no code change needed, none made), and independent
+test/typecheck re-runs are green. Ready for Arch to proceed to deploy per
+the Open Questions in `handoff/REVIEW-REQUEST.md`.
