@@ -1,16 +1,15 @@
 // TradeFlow — "tick" Edge Function (Deno). Invoked every 2 minutes by
 // pg_cron (see supabase/migrations/0003_cron.sql) via pg_net. Per
 // invocation: evaluates due graph_reminders and sends Web Push
-// notifications for anything that fires, and calibrates a price basis
-// against the Binance baseline that `tick-fast` maintains (see
-// handoff/ARCHITECT-BRIEF.md's Step 8/9/10) using chartgoldprice.com,
-// falling back to GoldAPI.io only when chartgoldprice.com itself fails.
+// notifications for anything that fires, and runs a read-only
+// chartgoldprice.com accuracy check against the Binance baseline that
+// `tick-fast` maintains (see handoff/ARCHITECT-BRIEF.md's Step 8).
 //
 // As of Step 8, price-alert evaluation and the instruments.last_price/
 // last_price_at write have moved to the new `tick-fast` Edge Function
 // (polled every 10 seconds directly off Binance — see
-// supabase/functions/tick-fast/index.ts). This function writes only
-// `instruments.price_basis`/`price_basis_at` (Step 9/10) — it never writes
+// supabase/functions/tick-fast/index.ts). This function is now
+// **read-only** with respect to `instruments`: it never writes
 // last_price/last_price_at. It also never touches `price_alerts`.
 //
 // Uses the Supabase **service role** client — this is the one place
@@ -31,7 +30,6 @@ import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.4
 import type { GraphReminder, Instrument } from "@tradeflow/types";
 import { BinanceProvider } from "../../../packages/market-data/src/binanceProvider.ts";
 import { ChartGoldPriceProvider } from "../../../packages/market-data/src/chartGoldPriceProvider.ts";
-import { GoldApiProvider } from "../../../packages/market-data/src/goldApiProvider.ts";
 import { computeNextTriggerAt } from "../../../packages/alert-engine/src/computeNextTriggerAt.ts";
 import { computePriceBasis } from "../../../packages/alert-engine/src/priceBasis.ts";
 import {
@@ -137,47 +135,6 @@ async function processGraphReminders(
 }
 
 /**
- * Step 10: chartgoldprice.com has "no SLA, as-is/as-available" (see
- * ChartGoldPriceProvider's own doc comment and KG-15) and has been
- * observed stale for hours at a time in production. Rather than let the
- * basis calibration below go stale for that whole outage window, fall back
- * to GoldAPI.io — sourced from `FOREXCOM:XAUUSD`, a real forex/CFD feed —
- * *only* when chartgoldprice.com's own fetch/staleness check rejects. This
- * keeps GoldAPI.io usage naturally low (it's only ever called during a
- * chartgoldprice.com outage), which matters because its free tier is
- * capped at 100 requests/month — far too low to call on every 2-minute
- * tick unconditionally. `GOLDAPI_API_KEY` is optional: if unset, a
- * chartgoldprice.com failure just skips this tick's calibration entirely,
- * same as Step 9's original behavior.
- */
-async function fetchCalibrationReference(): Promise<{ price: number; source: string }> {
-  try {
-    const chartGoldPrice = await new ChartGoldPriceProvider().getPrice(XAUUSD_SYMBOL);
-    return { price: chartGoldPrice.price, source: "CHARTGOLDPRICE" };
-  } catch (chartGoldPriceErr) {
-    const chartGoldPriceReason = describeProviderError(chartGoldPriceErr);
-    const goldApiKey = Deno.env.get("GOLDAPI_API_KEY");
-    if (!goldApiKey) {
-      throw new Error(
-        `chartgoldprice.com failed (${chartGoldPriceReason}) and no GOLDAPI_API_KEY is configured for fallback.`,
-      );
-    }
-    console.error(
-      `chartgoldprice.com calibration reference failed (${chartGoldPriceReason}); falling back to GoldAPI.io.`,
-    );
-    try {
-      const goldApi = await new GoldApiProvider({ apiKey: goldApiKey }).getPrice(XAUUSD_SYMBOL);
-      return { price: goldApi.price, source: "GOLDAPI" };
-    } catch (goldApiErr) {
-      throw new Error(
-        `chartgoldprice.com failed (${chartGoldPriceReason}) and GoldAPI.io fallback also failed ` +
-          `(${describeProviderError(goldApiErr)}).`,
-      );
-    }
-  }
-}
-
-/**
  * Step 8 added this as a routine, read-only accuracy check. Step 9 extends
  * it to also *apply* the result: `tick-fast` prices XAUUSD off Binance's
  * PAXG/USDT ticker, which trades at its own drifting premium/discount
@@ -186,14 +143,13 @@ async function fetchCalibrationReference(): Promise<{ price: number; source: str
  * mismatch against TradingView) to fix. Every 2 minutes: fetch a *fresh*
  * raw Binance price (independent of `instruments.last_price`, which — as of
  * Step 9 — is itself basis-corrected by `tick-fast` and so is no longer a
- * pure raw baseline to compare against) and a calibration reference (Step
- * 10: chartgoldprice.com, falling back to GoldAPI.io — see
- * `fetchCalibrationReference` above), compute the offset between them, and
- * write it to `instruments.price_basis`/`price_basis_at` if it passes a
- * sanity bound (see packages/alert-engine/src/priceBasis.ts) — an outlier
- * reading is logged and skipped, leaving the previous basis in place,
- * rather than letting one bad reading swing the live alert price. `tick`
- * remains the sole writer of `price_basis`/`price_basis_at`, mirroring
+ * pure raw baseline to compare against) and chartgoldprice.com's quote,
+ * compute the offset between them, and write it to
+ * `instruments.price_basis`/`price_basis_at` if it passes a sanity bound
+ * (see packages/alert-engine/src/priceBasis.ts) — an outlier reading is
+ * logged and skipped, leaving the previous basis in place, rather than
+ * letting one bad chartgoldprice response swing the live alert price.
+ * `tick` remains the sole writer of `price_basis`/`price_basis_at`, mirroring
  * `tick-fast`'s sole ownership of `last_price`/`last_price_at` — never both
  * from the same function.
  */
@@ -212,21 +168,20 @@ async function checkChartGoldPriceAccuracy(
   }
 
   try {
-    const [reference, rawBinance] = await Promise.all([
-      fetchCalibrationReference(),
+    const [chartGoldPrice, rawBinance] = await Promise.all([
+      new ChartGoldPriceProvider().getPrice(XAUUSD_SYMBOL),
       new BinanceProvider().getPrice(XAUUSD_SYMBOL),
     ]);
 
-    const basisResult = computePriceBasis(reference.price, rawBinance.price);
+    const basisResult = computePriceBasis(chartGoldPrice.price, rawBinance.price);
 
     if (basisResult.rejected) {
       console.error(
-        `Price basis accuracy check: basis update skipped — ${basisResult.reason} ` +
-          `(reference=${reference.price} via ${reference.source}, rawBinance=${rawBinance.price})`,
+        `chartgoldprice.com accuracy check: basis update skipped — ${basisResult.reason} ` +
+          `(chartgoldprice=${chartGoldPrice.price}, rawBinance=${rawBinance.price})`,
       );
       return {
-        referenceSource: reference.source,
-        referencePrice: reference.price,
+        chartGoldPrice: chartGoldPrice.price,
         rawBinance: rawBinance.price,
         deltaPct: basisResult.deltaPct,
         basisUpdated: false,
@@ -245,14 +200,13 @@ async function checkChartGoldPriceAccuracy(
     }
 
     console.log(
-      `Price basis accuracy check: reference=${reference.price} (via ${reference.source}), ` +
+      `chartgoldprice.com accuracy check: chartgoldprice=${chartGoldPrice.price}, ` +
         `rawBinance=${rawBinance.price}, basis=${basisResult.basis.toFixed(4)} ` +
         `(${basisResult.deltaPct.toFixed(4)}%)`,
     );
 
     return {
-      referenceSource: reference.source,
-      referencePrice: reference.price,
+      chartGoldPrice: chartGoldPrice.price,
       rawBinance: rawBinance.price,
       basis: basisResult.basis,
       deltaPct: basisResult.deltaPct,
@@ -260,7 +214,7 @@ async function checkChartGoldPriceAccuracy(
     };
   } catch (err) {
     const reason = describeProviderError(err);
-    console.error(`Price basis accuracy check skipped: ${reason}`);
+    console.error(`chartgoldprice.com accuracy check skipped: ${reason}`);
     return { skipped: true, reason };
   }
 }
