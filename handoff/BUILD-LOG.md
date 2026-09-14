@@ -5,9 +5,9 @@
 
 ## Current Status
 
-**Active step:** Step 9 — code-complete, locally verified, NOT yet deployed. See Step History below.
+**Active step:** Step 9 stands as shipped (chartgoldprice.com-only calibration). Step 10 (GoldAPI.io fallback) was built and deployed, then reverted 2026-09-14 per owner's call that GoldAPI.io is unreliable — see Step History.
 **Last cleared:** Step 8 — 2026-09-11 (deployed and verified live).
-**Blocked on:** nothing currently. Step 9's `0006_price_basis.sql` needs manual application via the dashboard SQL Editor (KG-8), then `supabase functions deploy tick` and `supabase functions deploy tick-fast`, before the calibration takes effect live.
+**Blocked on:** nothing currently. Step 9's `0006_price_basis.sql` needs manual application via the dashboard SQL Editor (KG-8) if not already done, then `supabase functions deploy tick` and `supabase functions deploy tick-fast` to (re)apply the reverted, chartgoldprice-only `tick`.
 
 ### Known Gaps
 - **KG-16** — An unexplained `"workspaces": ["apps/*", "packages/*"]` field has now appeared in root `package.json` three separate times across three different Bob sessions (Step 7's build, Step 8's build, this fix round was clean), always byte-identical, always reverted before commit. Harmless (pnpm ignores this field entirely — it's the npm/yarn workspaces convention), but the recurrence across independent sessions suggests some tool invoked during a Bob session (candidate: a `deno check`/`deno run` command executed from the repo root rather than scoped into `supabase/functions`, which also produced a stray root-level `deno.lock` this same session, deleted before commit) is auto-adding it, though this hasn't been confirmed. Worth investigating properly if it keeps recurring; not blocking any step so far.
@@ -65,6 +65,15 @@ zero dependency on the owner's laptop, browser, or any running local process.
 ---
 
 ## Step History
+
+### Step 10 (built, then reverted) — GoldAPI.io fallback for the price-basis calibration reference
+*Date: 2026-09-14*
+
+Built, unit/locally-verified, committed (`33b17b5`), and deployed to `tick` per the Step 10 entry that followed this one in history — see git history for the full original entry's content (`git show 33b17b5`). Owner then judged GoldAPI.io itself unreliable and asked to drop it and stick with chartgoldprice.com only. Reverted cleanly via `git revert 33b17b5` (commit `225a21a`) — removes `packages/market-data/src/goldApiProvider.ts` and its tests, restores `tick/index.ts`/`_shared/notifications.ts`/`packages/market-data/src/index.ts` to their Step 9 (chartgoldprice.com-only) state. Re-verified after revert: `pnpm build`/`test`/`typecheck` all green (market-data back to 25/25, `goldApiProvider.test.ts` gone), `deno check` clean on `tick/index.ts`.
+
+Net effect: Step 9's calibration stands as originally shipped — chartgoldprice.com only, no fallback. When chartgoldprice.com is down/stale, `price_basis` simply doesn't update for that tick (same behavior as immediately after Step 9, before Step 10 existed) — this is accepted as-is per the owner's call, not treated as a gap to re-solve differently right now.
+
+---
 
 ### Step 9 — Calibrate Binance PAXG price against chartgoldprice.com spot ("basis") — Status: code-complete, verified locally against a throwaway `supabase start` stack with real Binance + chartgoldprice.com network calls; NOT yet deployed/committed
 *Date: 2026-09-14*
