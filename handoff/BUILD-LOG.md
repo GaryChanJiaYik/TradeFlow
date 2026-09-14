@@ -73,6 +73,8 @@ Built, unit/locally-verified, committed (`33b17b5`), and deployed to `tick` per 
 
 Net effect: Step 9's calibration stands as originally shipped — chartgoldprice.com only, no fallback. When chartgoldprice.com is down/stale, `price_basis` simply doesn't update for that tick (same behavior as immediately after Step 9, before Step 10 existed) — this is accepted as-is per the owner's call, not treated as a gap to re-solve differently right now.
 
+Also researched and rejected the same day: **Forex.com's REST API** (CIAPI/GCAPI, run by StoneX/GAIN Capital) as another possible calibration reference. It's a trading API for account holders, not a standalone price feed — access requires an actual Forex.com trading account plus emailing `support.en@forex.com` for an "AppKey," with ~3 business days' manual approval. No code was written for this (research-only, rejected before implementation). This is the same broker-account-signup wall already hit and abandoned for OANDA, Capital.com, and Deriv in the Step 2 revision (12 providers tried total) — owner chose not to repeat that path. If a future session considers a broker-style API again, check this note first; the pattern (multi-day manual approval gating a personal single-user app) has failed every time it's been tried in this project.
+
 ---
 
 ### Step 9 — Calibrate Binance PAXG price against chartgoldprice.com spot ("basis") — Status: code-complete, verified locally against a throwaway `supabase start` stack with real Binance + chartgoldprice.com network calls; NOT yet deployed/committed
