@@ -2,11 +2,15 @@
 // pg_cron (see supabase/migrations/0005_tick_fast_cron.sql) via pg_net. Per
 // invocation: fetches the latest XAUUSD price directly from Binance's
 // public PAXG/USDT ticker (no fallback — see handoff/ARCHITECT-BRIEF.md's
-// Step 8), evaluates it against every enabled/unexpired price_alerts row,
-// sends Web Push notifications for anything that fires, and unconditionally
-// updates instruments.last_price/last_price_at on a successful fetch. This
-// function is the sole writer of that baseline going forward — it never
-// reads or writes graph_reminders (that stays exclusively in `tick`).
+// Step 8), corrects it against real spot gold using the basis `tick`
+// calibrates every 2 minutes from chartgoldprice.com (Step 9 — see
+// packages/alert-engine/src/priceBasis.ts), evaluates the corrected price
+// against every enabled/unexpired price_alerts row, sends Web Push
+// notifications for anything that fires, and unconditionally updates
+// instruments.last_price/last_price_at (the corrected price) on a
+// successful fetch. This function is the sole writer of that baseline going
+// forward — it never reads or writes graph_reminders (that stays
+// exclusively in `tick`).
 //
 // Split out of `tick/index.ts` as a separate function (not a branching flag
 // in the same file) specifically so this hot 10-second path never shares a
@@ -23,6 +27,7 @@ import {
   type EvaluableAlert,
 } from "../../../packages/alert-engine/src/evaluatePriceAlert.ts";
 import { BinanceProvider } from "../../../packages/market-data/src/binanceProvider.ts";
+import { applyPriceBasis } from "../../../packages/alert-engine/src/priceBasis.ts";
 import {
   configureWebPush,
   describeProviderError,
@@ -152,7 +157,21 @@ Deno.serve(async (_req: Request) => {
     const provider = new BinanceProvider();
     const tick = await provider.getPrice(instrument.symbol);
 
-    summary.priceAlerts = await processPriceAlerts(supabase, instrument, tick.price, now);
+    // Step 9: correct the raw Binance PAXG price for its drifting
+    // premium/discount against real spot gold, using the basis `tick`
+    // calibrates every 2 minutes from chartgoldprice.com (see
+    // packages/alert-engine/src/priceBasis.ts and handoff/ARCHITECT-BRIEF.md
+    // Step 9). `instrument.price_basis` is null until that first
+    // calibration lands, in which case this is a no-op (raw price used
+    // unchanged) — same self-correcting-over-time shape as every other
+    // null-baseline branch in this project. Alerts are evaluated against,
+    // and the baseline is written as, this corrected price — not the raw
+    // Binance tick — so both alerting and any UI display of "current price"
+    // stay consistent with each other.
+    const correctedPrice = applyPriceBasis(tick.price, instrument.price_basis);
+    summary.price = { raw: tick.price, corrected: correctedPrice, basis: instrument.price_basis };
+
+    summary.priceAlerts = await processPriceAlerts(supabase, instrument, correctedPrice, now);
 
     // Unconditionally update the tick baseline, even with zero triggers, so
     // the next invocation (10s later) has a correct "previous price." This
@@ -162,7 +181,7 @@ Deno.serve(async (_req: Request) => {
     // visibility, no retry logic needed.
     const { error: instrumentUpdateError } = await supabase
       .from("instruments")
-      .update({ last_price: tick.price, last_price_at: tick.timestamp })
+      .update({ last_price: correctedPrice, last_price_at: tick.timestamp })
       .eq("id", instrument.id);
     if (instrumentUpdateError) {
       console.error(`Failed to update instrument ${instrument.id} last_price:`, instrumentUpdateError);

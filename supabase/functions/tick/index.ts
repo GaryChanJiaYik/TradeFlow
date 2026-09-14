@@ -28,8 +28,10 @@
 // pieces of Deno config this relies on (documented there).
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.45.4";
 import type { GraphReminder, Instrument } from "@tradeflow/types";
+import { BinanceProvider } from "../../../packages/market-data/src/binanceProvider.ts";
 import { ChartGoldPriceProvider } from "../../../packages/market-data/src/chartGoldPriceProvider.ts";
 import { computeNextTriggerAt } from "../../../packages/alert-engine/src/computeNextTriggerAt.ts";
+import { computePriceBasis } from "../../../packages/alert-engine/src/priceBasis.ts";
 import {
   configureWebPush,
   describeProviderError,
@@ -133,52 +135,82 @@ async function processGraphReminders(
 }
 
 /**
- * Step 8: chartgoldprice.com is no longer a production price source (that's
- * `FallbackMarketDataProvider`'s old job, now unused — see
- * handoff/ARCHITECT-BRIEF.md's Step 8 Decisions, left in place but
- * unimported here). This is now a routine, read-only accuracy check: fetch
- * chartgoldprice.com's current quote, compare it against the Binance
- * baseline `tick-fast` maintains in `instruments.last_price`/
- * `last_price_at`, and log the delta for observability. Never writes
- * `instruments` — `tick-fast` is the sole writer of that baseline as of
- * Step 8.
+ * Step 8 added this as a routine, read-only accuracy check. Step 9 extends
+ * it to also *apply* the result: `tick-fast` prices XAUUSD off Binance's
+ * PAXG/USDT ticker, which trades at its own drifting premium/discount
+ * ("basis") to real spot gold — this was flagged but left uncorrected back
+ * in the Step 2 revision, and turned out to matter enough (owner-reported
+ * mismatch against TradingView) to fix. Every 2 minutes: fetch a *fresh*
+ * raw Binance price (independent of `instruments.last_price`, which — as of
+ * Step 9 — is itself basis-corrected by `tick-fast` and so is no longer a
+ * pure raw baseline to compare against) and chartgoldprice.com's quote,
+ * compute the offset between them, and write it to
+ * `instruments.price_basis`/`price_basis_at` if it passes a sanity bound
+ * (see packages/alert-engine/src/priceBasis.ts) — an outlier reading is
+ * logged and skipped, leaving the previous basis in place, rather than
+ * letting one bad chartgoldprice response swing the live alert price.
+ * `tick` remains the sole writer of `price_basis`/`price_basis_at`, mirroring
+ * `tick-fast`'s sole ownership of `last_price`/`last_price_at` — never both
+ * from the same function.
  */
 async function checkChartGoldPriceAccuracy(
   supabase: SupabaseClient,
 ): Promise<Record<string, unknown>> {
   const { data: instrument, error: instrumentError } = await supabase
     .from("instruments")
-    .select("last_price, last_price_at")
+    .select("id, last_price, last_price_at")
     .eq("symbol", XAUUSD_SYMBOL)
     .eq("enabled", true)
-    .maybeSingle<Pick<Instrument, "last_price" | "last_price_at">>();
+    .maybeSingle<Pick<Instrument, "id" | "last_price" | "last_price_at">>();
 
   if (instrumentError || !instrument) {
     return { skipped: true, reason: "XAUUSD instrument not found or disabled" };
   }
-  if (instrument.last_price === null) {
-    return { skipped: true, reason: "No Binance baseline yet (tick-fast has not run)" };
-  }
 
   try {
-    const baselinePrice = Number(instrument.last_price);
-    const chartGoldPrice = await new ChartGoldPriceProvider().getPrice(XAUUSD_SYMBOL);
+    const [chartGoldPrice, rawBinance] = await Promise.all([
+      new ChartGoldPriceProvider().getPrice(XAUUSD_SYMBOL),
+      new BinanceProvider().getPrice(XAUUSD_SYMBOL),
+    ]);
 
-    const delta = chartGoldPrice.price - baselinePrice;
-    const deltaPct = (delta / baselinePrice) * 100;
+    const basisResult = computePriceBasis(chartGoldPrice.price, rawBinance.price);
+
+    if (basisResult.rejected) {
+      console.error(
+        `chartgoldprice.com accuracy check: basis update skipped — ${basisResult.reason} ` +
+          `(chartgoldprice=${chartGoldPrice.price}, rawBinance=${rawBinance.price})`,
+      );
+      return {
+        chartGoldPrice: chartGoldPrice.price,
+        rawBinance: rawBinance.price,
+        deltaPct: basisResult.deltaPct,
+        basisUpdated: false,
+        reason: basisResult.reason,
+      };
+    }
+
+    const basisAt = new Date().toISOString();
+    const { error: basisUpdateError } = await supabase
+      .from("instruments")
+      .update({ price_basis: basisResult.basis, price_basis_at: basisAt })
+      .eq("id", instrument.id);
+    if (basisUpdateError) {
+      console.error(`Failed to update instrument ${instrument.id} price_basis:`, basisUpdateError);
+      return { skipped: true, reason: "price_basis write failed" };
+    }
 
     console.log(
       `chartgoldprice.com accuracy check: chartgoldprice=${chartGoldPrice.price}, ` +
-        `binanceBaseline=${baselinePrice} (as of ${instrument.last_price_at}), ` +
-        `delta=${delta.toFixed(4)} (${deltaPct.toFixed(4)}%)`,
+        `rawBinance=${rawBinance.price}, basis=${basisResult.basis.toFixed(4)} ` +
+        `(${basisResult.deltaPct.toFixed(4)}%)`,
     );
 
     return {
       chartGoldPrice: chartGoldPrice.price,
-      binanceBaseline: baselinePrice,
-      binanceBaselineAt: instrument.last_price_at,
-      delta,
-      deltaPct,
+      rawBinance: rawBinance.price,
+      basis: basisResult.basis,
+      deltaPct: basisResult.deltaPct,
+      basisUpdated: true,
     };
   } catch (err) {
     const reason = describeProviderError(err);

@@ -5,9 +5,9 @@
 
 ## Current Status
 
-**Active step:** Step 8 DEPLOYED AND VERIFIED LIVE — 2026-09-11.
-**Last cleared:** Step 8 — 2026-09-11.
-**Blocked on:** nothing currently.
+**Active step:** Step 9 — code-complete, locally verified, NOT yet deployed. See Step History below.
+**Last cleared:** Step 8 — 2026-09-11 (deployed and verified live).
+**Blocked on:** nothing currently. Step 9's `0006_price_basis.sql` needs manual application via the dashboard SQL Editor (KG-8), then `supabase functions deploy tick` and `supabase functions deploy tick-fast`, before the calibration takes effect live.
 
 ### Known Gaps
 - **KG-16** — An unexplained `"workspaces": ["apps/*", "packages/*"]` field has now appeared in root `package.json` three separate times across three different Bob sessions (Step 7's build, Step 8's build, this fix round was clean), always byte-identical, always reverted before commit. Harmless (pnpm ignores this field entirely — it's the npm/yarn workspaces convention), but the recurrence across independent sessions suggests some tool invoked during a Bob session (candidate: a `deno check`/`deno run` command executed from the repo root rather than scoped into `supabase/functions`, which also produced a stray root-level `deno.lock` this same session, deleted before commit) is auto-adding it, though this hasn't been confirmed. Worth investigating properly if it keeps recurring; not blocking any step so far.
@@ -65,6 +65,31 @@ zero dependency on the owner's laptop, browser, or any running local process.
 ---
 
 ## Step History
+
+### Step 9 — Calibrate Binance PAXG price against chartgoldprice.com spot ("basis") — Status: code-complete, verified locally against a throwaway `supabase start` stack with real Binance + chartgoldprice.com network calls; NOT yet deployed/committed
+*Date: 2026-09-14*
+
+Trigger: owner reported TradeFlow's displayed/alerted XAUUSD price disagreeing with TradingView's. Root cause: `tick-fast` (Step 8) prices XAUUSD off Binance's PAXG/USDT ticker, a tokenized-gold proxy that trades at its own drifting premium/discount ("basis") to real spot gold — flagged but deliberately left uncorrected in the Step 2 revision ("no offset/calibration against OANDA... the PAXG-vs-spot basis isn't constant and there's no free live reference to calibrate against anyway"). `tick`'s existing Step 8 chartgoldprice accuracy check gave exactly that reference, just never applied it. Checked whether real OANDA credentials (a proper forex broker, closer to what TradingView shows) exist now instead — they don't; `OANDA_API_TOKEN`/`OANDA_ACCOUNT_ID` in `supabase/functions/.env.local` are still local-mock placeholders from Step 2's local verification.
+
+Files changed:
+- `packages/alert-engine/src/priceBasis.ts` (new) — pure, I/O-free `computePriceBasis(referencePrice, rawPrice)` (returns `{ rejected: false, basis, deltaPct }` or `{ rejected: true, reason, deltaPct }`; rejects if the implied delta exceeds a `MAX_BASIS_PCT = 5` sanity bound, so one bad/stale chartgoldprice reading can't swing the live alert price) and `applyPriceBasis(rawPrice, basis)` (`basis === null` → raw price unchanged, same null-baseline-skip shape as this project's other first-run branches).
+- `packages/alert-engine/src/__tests__/priceBasis.test.ts` (new, 9 cases) — positive/negative/zero basis, right-at-bound accept, over-bound reject (both directions), null-basis passthrough, positive/negative basis application.
+- `packages/alert-engine/src/index.ts` — added `export * from "./priceBasis"`.
+- `packages/types/src/instrument.ts` — added `price_basis: number | null`, `price_basis_at: string | null` to `Instrument`, mirroring the new columns.
+- `supabase/migrations/0006_price_basis.sql` (new) — `alter table instruments add column if not exists price_basis numeric, add column if not exists price_basis_at timestamptz`. Nullable, no default (mirrors `last_price`'s null-until-first-tick convention). Documented rollback (`drop column if exists` on both) — safe at any time since a missing/null basis just reverts to Step 8's raw-PAXG behavior.
+- `supabase/functions/tick/index.ts` — `checkChartGoldPriceAccuracy` extended from read-only logging to also *write* the calibration: fetches a **fresh** raw Binance price (independent of `instruments.last_price`, which is itself basis-corrected as of this step and so is no longer a pure raw baseline) alongside chartgoldprice.com's quote, runs `computePriceBasis`, and on acceptance writes `instruments.price_basis`/`price_basis_at`. On rejection or either fetch failing: logs and skips, leaving the previous basis in place untouched. `tick` is now the sole writer of `price_basis`/`price_basis_at`, mirroring (never overlapping) `tick-fast`'s sole ownership of `last_price`/`last_price_at` — each function writes exactly one of the two field-pairs, never both.
+- `supabase/functions/tick-fast/index.ts` — after fetching the raw Binance tick, computes `correctedPrice = applyPriceBasis(tick.price, instrument.price_basis)` and uses `correctedPrice` (not the raw tick) for both `processPriceAlerts` evaluation and the `instruments.last_price`/`last_price_at` write, so alerting and any future "current price" display stay consistent with each other. Added `summary.price = { raw, corrected, basis }` for observability. `processPriceAlerts` itself untouched.
+
+**Local verification performed (throwaway `supabase start` Docker stack, torn down after — no real project touched):**
+- `pnpm build`/`test`/`typecheck` at repo root — all green (new `priceBasis.test.ts`: 9/9; totals otherwise unchanged). `deno check` clean on both `tick/index.ts` and `tick-fast/index.ts`.
+- `npx supabase db reset` applied `0001`-`0006` cleanly in order; confirmed via the local REST API that `instruments` gained `price_basis`/`price_basis_at`, both `null` on a fresh row.
+- Ran `tick` for real against **live** chartgoldprice.com + Binance (via `deno run` against a temporary, non-committed port-8321 copy of the file — port 8000 was unavailable locally, held by an unrelated running project's Docker container, not touched). chartgoldprice.com's feed happened to be genuinely stale at test time (453 minutes old, a real external-outage condition, same class as KG-15) — this exercised the **reject/skip path for real**: logged and skipped, `price_basis` correctly left untouched rather than nulled out or corrupted.
+- To exercise the **write path**, manually seeded `instruments.price_basis = 15.5` via the local REST API (simulating what `tick` writes on a successful calibration — the write itself uses the identical `update(...).eq("id", ...)` shape already proven live by `tick-fast`'s `last_price` write) and ran `tick-fast` for real against live Binance (raw price `4335.66`): response and DB both showed `last_price = 4351.16` (`4335.66 + 15.5`, exact), confirming `applyPriceBasis` is wired correctly end-to-end. Confirmed `price_basis`/`price_basis_at` were **not** touched by this `tick-fast` run (single-writer-per-field invariant holds).
+- Deleted the two temporary local-only port-override copies before finishing; `git status` confirmed only the intended files changed (no stray `package.json` workspaces field or `deno.lock`, per KG-16).
+
+Deploy: NOT deployed. `0006_price_basis.sql` is written and locally verified only — Arch applies it via the dashboard SQL Editor after review, same as prior migrations (KG-8). `tick` and `tick-fast` need `supabase functions deploy` for this step's changes to take effect once the migration is applied.
+
+---
 
 ### Step 8 — Fast Binance-driven price-alert polling (10s), chartgoldprice demoted to accuracy check — Status: code-complete, verified locally against a throwaway `supabase start` stack with real Binance + chartgoldprice.com network calls, awaiting review; NOT yet deployed/committed
 *Date: 2026-09-11*
