@@ -5,9 +5,9 @@
 
 ## Current Status
 
-**Active step:** Step 9 — code-complete, locally verified, NOT yet deployed. See Step History below.
+**Active step:** Step 10 — code-complete, locally verified, NOT yet deployed. See Step History below.
 **Last cleared:** Step 8 — 2026-09-11 (deployed and verified live).
-**Blocked on:** nothing currently. Step 9's `0006_price_basis.sql` needs manual application via the dashboard SQL Editor (KG-8), then `supabase functions deploy tick` and `supabase functions deploy tick-fast`, before the calibration takes effect live.
+**Blocked on:** nothing currently. Step 9's `0006_price_basis.sql` needs manual application via the dashboard SQL Editor (KG-8), then `supabase functions deploy tick`/`tick-fast`. Step 10 adds no migration — just redeploy `tick` again after that. Step 10's GoldAPI.io fallback is inert until the owner signs up at goldapi.io and runs `supabase secrets set GOLDAPI_API_KEY=<token>`.
 
 ### Known Gaps
 - **KG-16** — An unexplained `"workspaces": ["apps/*", "packages/*"]` field has now appeared in root `package.json` three separate times across three different Bob sessions (Step 7's build, Step 8's build, this fix round was clean), always byte-identical, always reverted before commit. Harmless (pnpm ignores this field entirely — it's the npm/yarn workspaces convention), but the recurrence across independent sessions suggests some tool invoked during a Bob session (candidate: a `deno check`/`deno run` command executed from the repo root rather than scoped into `supabase/functions`, which also produced a stray root-level `deno.lock` this same session, deleted before commit) is auto-adding it, though this hasn't been confirmed. Worth investigating properly if it keeps recurring; not blocking any step so far.
@@ -65,6 +65,28 @@ zero dependency on the owner's laptop, browser, or any running local process.
 ---
 
 ## Step History
+
+### Step 10 — GoldAPI.io fallback for the price-basis calibration reference — Status: code-complete, verified locally against a throwaway `supabase start` stack (real chartgoldprice.com failure, mocked GoldAPI.io — no real key available yet); NOT yet deployed/committed
+*Date: 2026-09-14*
+
+Trigger: Step 9's calibration shipped, but chartgoldprice.com happened to be genuinely stale for 8+ hours the same day (confirmed by fetching its live `/api/data` endpoint directly: `meta.updated_at` was 466-486 minutes old across several checks, well past the 15-minute threshold, with response headers confirming it wasn't a caching artifact — `X-Vercel-Cache: MISS`, `Age: 0`). That left `instruments.price_basis` null for the whole outage — Step 9's own reject-path working exactly as designed, but leaving the owner's actual complaint (price mismatch vs. TradingView) unfixed for as long as chartgoldprice.com stays down. Researched GoldAPI.io as an alternative per the owner's suggestion: sources from `FOREXCOM:XAUUSD` (a real forex/CFD feed, closer to what TradingView's default XAUUSD chart shows), but requires signup + an API token (not keyless) and its free tier caps at 100 requests/month — nowhere near enough for `tick`'s 2-minute cadence (~21,600/month) or `tick-fast`'s 10-second one. Owner chose: use it only as a fallback when chartgoldprice.com's own fetch/staleness check rejects, keeping GoldAPI.io usage naturally low (only called during a chartgoldprice.com outage) rather than switching cadence or provider wholesale.
+
+Files changed:
+- `packages/market-data/src/goldApiProvider.ts` (new) — `GoldApiProvider implements MarketDataProvider`, `GET https://www.goldapi.io/api/XAU/USD` with an `x-access-token` header, mirrors `ChartGoldPriceProvider`/`BinanceProvider`'s typed-error pattern (`GoldApiProviderError` — `UNKNOWN_INSTRUMENT`/`NETWORK_ERROR`/`HTTP_ERROR`/`INVALID_PRICE`/`STALE_DATA`). Own staleness bound (`STALE_DATA_THRESHOLD_MS = 30 * 60 * 1000`, looser than chartgoldprice's 15 minutes) since this is only ever an infrequent fallback, not polled on a tight cadence.
+- `packages/market-data/src/__tests__/goldApiProvider.test.ts` (new, 11 cases, mocked `fetch`) — successful parse (asserts the `x-access-token` header is sent), unknown instrument (no fetch made), network error, non-JSON body, HTTP error (429 rate-limit case explicitly), missing/non-numeric price, missing/stale/boundary timestamp, default-fetch construction.
+- `packages/market-data/src/index.ts` — added `export * from "./goldApiProvider"`.
+- `supabase/functions/_shared/notifications.ts` — `describeProviderError` now also recognizes `GoldApiProviderError` for the `CODE: message` format (previously only `ChartGoldPriceProviderError`/`BinanceProviderError`).
+- `supabase/functions/tick/index.ts` — new `fetchCalibrationReference()`: tries `ChartGoldPriceProvider` first; on any failure, checks for an optional `GOLDAPI_API_KEY` env var — if unset, re-throws the original chartgoldprice.com error (identical to Step 9's behavior, so an owner who hasn't signed up for GoldAPI.io yet sees no change); if set, falls back to `GoldApiProvider` and logs the fallback. `checkChartGoldPriceAccuracy` now calls this instead of `ChartGoldPriceProvider` directly, and its summary fields are renamed `chartGoldPrice`/`chartGoldPriceCheck`'s inner keys -> `referenceSource`/`referencePrice` to reflect that the reference can now be either provider (the outer `summary.chartGoldPriceCheck` key itself is unchanged, avoiding an unrelated rename). No change to the sanity-bound/write logic itself (`computePriceBasis`, `price_basis`/`price_basis_at` write) — same as Step 9.
+
+**Local verification performed (throwaway `supabase start` Docker stack, torn down after — no real project touched):**
+- `pnpm build`/`test`/`typecheck` at repo root — all green (new `goldApiProvider.test.ts`: 11/11; totals otherwise unchanged). `deno check` clean on `tick/index.ts` and `tick-fast/index.ts`.
+- Ran `tick` for real (via a temporary, non-committed port-8321 copy of the file) against **live** chartgoldprice.com — genuinely stale again at test time (486 minutes old) — with `GOLDAPI_API_KEY` set to a dummy value and the `GoldApiProvider` call's `fetchFn` redirected to a small local mock HTTP server (standing in for GoldAPI.io itself, since no real API key exists yet and this avoids ever touching the owner's future free-tier quota during testing) returning a fixed `{price: 4360.42, timestamp: <now>}`. Result: the real chartgoldprice.com failure was logged, the fallback fired, `price_basis` was written as `26.31` (`4360.42` mock reference minus a real, freshly-fetched Binance price of `4334.11`), and `instruments.last_price` was confirmed **unchanged** by this `tick` run (still Step 9's value) — the single-writer-per-field invariant holds with the fallback added.
+- Re-ran the same scenario with `GOLDAPI_API_KEY` unset: confirmed the fallback correctly does *not* fire — the original chartgoldprice.com `STALE_DATA` error surfaces as the skip reason, byte-for-byte the same shape as Step 9's pre-fallback behavior. Confirms an owner who hasn't signed up for GoldAPI.io yet sees zero behavioral change from this step.
+- Deleted the temporary local-verify file and stopped the mock server before finishing; `git status` confirmed only the intended files changed.
+
+Deploy: NOT deployed. Needs `supabase functions deploy tick` (no migration needed — this step adds no schema changes, reuses Step 9's `price_basis`/`price_basis_at` columns). `GOLDAPI_API_KEY` is optional — until the owner signs up at goldapi.io and runs `supabase secrets set GOLDAPI_API_KEY=<token>`, this step is a no-op in production (chartgoldprice.com failures skip exactly as they did after Step 9).
+
+---
 
 ### Step 9 — Calibrate Binance PAXG price against chartgoldprice.com spot ("basis") — Status: code-complete, verified locally against a throwaway `supabase start` stack with real Binance + chartgoldprice.com network calls; NOT yet deployed/committed
 *Date: 2026-09-14*

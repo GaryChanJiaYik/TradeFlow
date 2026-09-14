@@ -9,15 +9,21 @@ import webpush from "npm:web-push@3.6.7";
 import type { Device } from "@tradeflow/types";
 import { BinanceProviderError } from "../../../packages/market-data/src/binanceProvider.ts";
 import { ChartGoldPriceProviderError } from "../../../packages/market-data/src/chartGoldPriceProvider.ts";
+import { GoldApiProviderError } from "../../../packages/market-data/src/goldApiProvider.ts";
 
 /**
  * Formats one provider-level error for a function's response summary.
  * Handles both typed provider errors (with a `.code`) and anything else
  * that bubbled up unexpectedly, so a real failure always logs something
- * actionable instead of an opaque `[object Object]`. Step 7.
+ * actionable instead of an opaque `[object Object]`. Step 7 (Step 10 added
+ * GoldApiProviderError).
  */
 export function describeProviderError(err: unknown): string {
-  if (err instanceof ChartGoldPriceProviderError || err instanceof BinanceProviderError) {
+  if (
+    err instanceof ChartGoldPriceProviderError ||
+    err instanceof BinanceProviderError ||
+    err instanceof GoldApiProviderError
+  ) {
     return `${err.code}: ${err.message}`;
   }
   return err instanceof Error ? err.message : String(err);
