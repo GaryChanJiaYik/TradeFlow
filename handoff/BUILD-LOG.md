@@ -5,9 +5,9 @@
 
 ## Current Status
 
-**Active step:** Step 9 stands as shipped (chartgoldprice.com-only calibration). Step 10 (GoldAPI.io fallback) was built and deployed, then reverted 2026-09-14 per owner's call that GoldAPI.io is unreliable — see Step History.
+**Active step:** Step 11 — code-complete, locally verified (Supabase side only), NOT yet deployed. MQL4 EA/VPS side entirely unverified — see Step History.
 **Last cleared:** Step 8 — 2026-09-11 (deployed and verified live).
-**Blocked on:** nothing currently. Step 9's `0006_price_basis.sql` needs manual application via the dashboard SQL Editor (KG-8) if not already done, then `supabase functions deploy tick` and `supabase functions deploy tick-fast` to (re)apply the reverted, chartgoldprice-only `tick`.
+**Blocked on:** Step 11's real-world completion is gated on the owner: provisioning the OCI VPS, compiling `mt4/TradeFlowMt4Bridge.mq4` for the first time, and the several GUI-only MT4 setup steps in `mt4/README.md` — none of which can be done from this session. The Supabase-side code (migration, `mt4-webhook`, `tick-fast`'s fallback gate) is ready to deploy independently of that and doesn't regress anything if the VPS/EA never materializes (falls back to today's Binance-only behavior).
 
 ### Known Gaps
 - **KG-16** — An unexplained `"workspaces": ["apps/*", "packages/*"]` field has now appeared in root `package.json` three separate times across three different Bob sessions (Step 7's build, Step 8's build, this fix round was clean), always byte-identical, always reverted before commit. Harmless (pnpm ignores this field entirely — it's the npm/yarn workspaces convention), but the recurrence across independent sessions suggests some tool invoked during a Bob session (candidate: a `deno check`/`deno run` command executed from the repo root rather than scoped into `supabase/functions`, which also produced a stray root-level `deno.lock` this same session, deleted before commit) is auto-adding it, though this hasn't been confirmed. Worth investigating properly if it keeps recurring; not blocking any step so far.
@@ -65,6 +65,140 @@ zero dependency on the owner's laptop, browser, or any running local process.
 ---
 
 ## Step History
+
+### Step 11 — MT4/TMGM live-tick bridge + order-fill alerts — Status: code-complete, verified locally against a throwaway `supabase start` stack; NOT yet deployed. MQL4 EA and VPS runbook written but explicitly UNVERIFIED (no MetaEditor/MT4 terminal available in this environment)
+*Date: 2026-09-15*
+
+Trigger: owner trades XAUUSD on MT4 (broker TMGM) and wants the real broker price as
+TradeFlow's primary source, plus a push notification when an order fills. Explored and
+rejected this session before landing here: GoldAPI.io (built as Step 10, then reverted
+— owner judged it unreliable), Forex.com's API (needs an actual account + multi-day
+manual approval, same wall as OANDA/Capital.com/Deriv), TMGM's own free-VPS perk
+(needs 7 lots/month or $3,000 deposit — owner meets neither). Landed on a DIY MQL4 EA
+on OCI's free `VM.Standard.E2.1.Micro`. Planned via formal plan mode (one Plan-agent
+research pass covering MQL4 specifics via WebSearch/WebFetch against mql4.com/
+mql5.com — see the approved plan at
+`C:\Users\jychan\.claude\plans\this-is-my-project-nifty-mist.md`), approved by owner,
+then implemented directly in this session.
+
+Files changed:
+- `supabase/functions/_shared/processPriceAlerts.ts` (new) — `processPriceAlerts`
+  extracted verbatim out of `tick-fast/index.ts` (including Step 6's
+  confirm-write-before-push ordering), so both `tick-fast` and the new
+  `mt4-webhook` share one evaluator instead of duplicating it.
+- `supabase/functions/mt4-webhook/index.ts` (new) — TradeFlow's first *inbound*
+  webhook (every prior function is pg_cron-triggered or a logged-in browser session).
+  Auth via `x-webhook-secret` header against `MT4_WEBHOOK_SECRET`. Two payload types
+  on one endpoint (`PRICE_TICK`, `ORDER_FILLED`) — one URL, not two, because MT4's
+  `WebRequest()` allow-list is a manual GUI step per URL. `PRICE_TICK` runs the shared
+  `processPriceAlerts` against the raw MT4 price (no `applyPriceBasis` — MT4/TMGM is
+  already the real broker price that correction exists to approximate) and writes
+  `last_price`/`last_price_at`/`mt4_last_seen_at`/`price_source='MT4'`. `ORDER_FILLED`
+  sends a push notification (`pushToUserDevices`/`logNotification`, new event type)
+  to a fixed `MT4_WEBHOOK_USER_ID`.
+- `supabase/functions/tick-fast/index.ts` — new `isMt4Fresh` freshness gate (checks
+  `instruments.mt4_last_seen_at` against `MT4_FRESHNESS_SECONDS`, default 25s):
+  when MT4 is fresh, skips the Binance fetch, alert evaluation, AND the `last_price`
+  write entirely (not just the write) before anything else runs — exactly one active
+  evaluator at a time, chosen by freshness, so the same crossing is never evaluated
+  against two different price streams in the same window. Binance's own write path
+  gains `price_source: "BINANCE"`. Local `processPriceAlerts` function deleted;
+  imports from `_shared/processPriceAlerts.ts` instead.
+- `supabase/functions/_shared/notifications.ts` — `logNotification`'s `eventType`
+  param widened from an inline `"PRICE_ALERT" | "GRAPH_REMINDER"` literal to the
+  shared `NotificationEventType` (now three values).
+- `supabase/migrations/0007_mt4_webhook.sql` (new) — `instruments` gains
+  `mt4_last_seen_at timestamptz` and `price_source text check (...) default
+  'BINANCE'`; `notification_log`'s `event_type` check constraint gains
+  `'ORDER_FILLED'`. Documented rollback included.
+- `supabase/config.toml` — new `[functions.mt4-webhook]` section, `verify_jwt =
+  false` (the first `[functions.*]` section this repo has needed — every prior
+  function is called with the service-role key as its bearer token, itself a valid
+  project JWT; the MT4 EA has no such JWT to present, so without this every request
+  would be rejected by the platform gateway before the function's own
+  `x-webhook-secret` check ever runs).
+- `packages/types/src/enums.ts` — `NotificationEventType` gains `"ORDER_FILLED"`;
+  new `PriceSource = "MT4" | "BINANCE"`.
+- `packages/types/src/instrument.ts` — `Instrument` gains `mt4_last_seen_at: string |
+  null` and `price_source: PriceSource`.
+- `mt4/TradeFlowMt4Bridge.mq4` (new, outside the repo's package structure) — MQL4 EA:
+  `OnTimer` (every `InpHeartbeatSec`, default 5s) and throttled `OnTick` both push a
+  price tick and run fill detection; fill detection does a full ticket/type rescan
+  every poll (not incremental, to avoid a known `OrdersTotal()`-unchanged-between-
+  two-real-changes blind spot) and tracks ticket -> last-seen `OrderType()`, since a
+  pending order triggering keeps its ticket number (only the type changes) — a bare
+  "is this ticket new" check would miss that. Every `WebRequest()` failure mode
+  (network, timeout, `4060` = URL not allow-listed, non-200) is logged and swallowed,
+  never fatal — the EA never places/modifies/closes trades itself, so a webhook
+  outage has zero effect on actual trading.
+- `mt4/README.md` (new) — VPS runbook: OCI provisioning, swap file, Wine/Xvfb
+  install (scriptable), TMGM MT4 install + login + EA attach + WebRequest allow-list
+  (manual/GUI-only, no scriptable path for any of these four), Supabase-side secret
+  setup and deploy, and a verification checklist.
+
+**Local verification performed (throwaway `supabase start` Docker stack, torn down
+after — no real project touched):**
+- `pnpm build`/`test`/`typecheck` at repo root — all green, no regressions (this step
+  added no new package-level unit tests; `processPriceAlerts`'s move is mechanical
+  and covered indirectly by the same integration checks below). `deno check` clean on
+  `mt4-webhook/index.ts` and `tick-fast/index.ts`.
+- `npx supabase db reset` applied `0001`-`0007` cleanly; confirmed via the local REST
+  API that `instruments` gained `mt4_last_seen_at`/`price_source` (defaulting to
+  `null`/`'BINANCE'` on existing rows).
+- Created a local test user + a `price_alerts` row (target `4342`, `CROSS_UP`,
+  `ONCE`) with `instruments.last_price` seeded to `4340`. Ran `mt4-webhook` for real
+  (via a temporary, non-committed port-8321 copy of the file) with a live service-role
+  client against the local stack:
+  - Bad `x-webhook-secret` → `401 {"ok":false,"error":"unauthorized"}`.
+  - Malformed `type` → `400 {"ok":false,"error":"malformed or unrecognized payload"}`.
+  - Valid `PRICE_TICK` (`price: 4345`, crossing the seeded alert) → `200
+    {"priceAlerts":{"evaluated":1,"triggered":1}}`; confirmed in the DB:
+    `last_price=4345`, `price_source='MT4'`, `mt4_last_seen_at` set to the request
+    time, the alert's `enabled` flipped to `false` (ONCE consumed) with
+    `last_triggered_at` set, and a `notification_log` row
+    (`event_type='PRICE_ALERT'`, `status='PENDING'` — no device registered, expected).
+  - Valid `ORDER_FILLED` → `200`; confirmed a `notification_log` row with
+    `event_type='ORDER_FILLED'` (proving `0007`'s constraint change actually accepts
+    the new value, not just that the migration applied) and the correct message text.
+- Ran `tick-fast` (temporary port-8322 copy) with `mt4_last_seen_at` set to "just
+  now": confirmed it returned `{"priceAlerts":{"skipped":true,"reason":"MT4 is the
+  fresh primary source..."}}` and made no Binance call. Re-ran with
+  `mt4_last_seen_at` set to 27+ seconds in the past: confirmed it fell through to a
+  real Binance fetch and `price_source` flipped back to `'BINANCE'` in the DB, while
+  `mt4_last_seen_at` itself stayed untouched (confirming `tick-fast` never writes
+  that field — `mt4-webhook` remains its sole writer).
+- Deleted both temporary local-verify files before finishing; `git status` confirmed
+  only the intended files changed (no stray `package.json` workspaces field or
+  `deno.lock`, per KG-16).
+
+**NOT verified (flagged explicitly, not glossed over):**
+- `TradeFlowMt4Bridge.mq4` has never been compiled — no MetaEditor/MT4 terminal
+  available in this environment. Written carefully from real MQL4/MQL5 community
+  documentation (cited in the approved plan) but is a first draft, not proven-correct
+  code. The owner must compile and soak-test it on the actual VPS per
+  `mt4/README.md`'s verification checklist before trusting it for anything real.
+- No real OCI VPS was provisioned, no real TMGM account was touched, and no real
+  end-to-end fill notification has fired — all of `mt4/README.md`'s manual/GUI steps
+  are unexercised.
+
+Deploy: NOT deployed. `0007_mt4_webhook.sql` needs manual application via the
+dashboard SQL Editor (KG-8). `mt4-webhook` needs `supabase functions deploy
+mt4-webhook` (config.toml's `verify_jwt = false` for it is already committed) plus
+`MT4_WEBHOOK_SECRET`/`MT4_WEBHOOK_USER_ID` secrets set first. `tick-fast` needs
+redeploying for its fallback-gate change to take effect. The VPS/EA side is entirely
+owner-executed per `mt4/README.md` — nothing there can be done from this session.
+
+### Known Gaps (added from Step 11)
+- **KG-17** — `TradeFlowMt4Bridge.mq4` is unverified (see above) — the single
+  biggest risk in this step. Not blocking the Supabase-side code (which is fully
+  locally verified independent of the EA), but the feature delivers nothing real
+  until the owner compiles, attaches, and soak-tests it.
+- **KG-18** — No automated test coverage for `mt4-webhook`'s payload
+  parsing/auth logic (no unit tests added — this project's Deno Edge Functions have
+  none today, verified only via the `deno run`-against-a-local-stack pattern used
+  throughout, consistent with how `tick`/`tick-fast` have always been verified).
+
+---
 
 ### Step 10 (built, then reverted) — GoldAPI.io fallback for the price-basis calibration reference
 *Date: 2026-09-14*

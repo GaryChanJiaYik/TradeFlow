@@ -6,7 +6,7 @@
 // logic instead of drifting apart.
 import type { SupabaseClient } from "npm:@supabase/supabase-js@2.45.4";
 import webpush from "npm:web-push@3.6.7";
-import type { Device } from "@tradeflow/types";
+import type { Device, NotificationEventType } from "@tradeflow/types";
 import { BinanceProviderError } from "../../../packages/market-data/src/binanceProvider.ts";
 import { ChartGoldPriceProviderError } from "../../../packages/market-data/src/chartGoldPriceProvider.ts";
 
@@ -107,7 +107,7 @@ export async function logNotification(
   supabase: SupabaseClient,
   params: {
     userId: string;
-    eventType: "PRICE_ALERT" | "GRAPH_REMINDER";
+    eventType: NotificationEventType;
     title: string;
     message: string;
     push: PushResult;

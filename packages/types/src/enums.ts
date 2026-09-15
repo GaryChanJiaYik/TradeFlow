@@ -13,6 +13,8 @@ export type AssetType = "metal" | "forex" | "index" | "crypto";
 
 export type DevicePlatform = "web" | "ios" | "android";
 
-export type NotificationEventType = "PRICE_ALERT" | "GRAPH_REMINDER";
+export type NotificationEventType = "PRICE_ALERT" | "GRAPH_REMINDER" | "ORDER_FILLED";
 
 export type NotificationStatus = "SENT" | "FAILED" | "PENDING";
+
+export type PriceSource = "MT4" | "BINANCE";
