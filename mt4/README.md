@@ -69,8 +69,16 @@ sudo wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/
 sudo apt update
 sudo apt install -y --install-recommends winehq-stable wine32 xvfb
 
-# MT4 is 32-bit; a dedicated 32-bit prefix keeps it isolated
-export WINEARCH=win32
+# Deliberately NOT setting WINEARCH=win32 here, despite MT4's terminal.exe
+# itself being a 32-bit binary: confirmed against a real TMGM installer
+# (trademaxglobal4setup.exe) that broker-branded MT4 installers are commonly
+# 64-bit bootstrapper/installer wrappers even when the terminal they place
+# is 32-bit. A win32 prefix can ONLY run 32-bit binaries and fails the
+# installer itself with "Bad EXE format" before MT4 is ever installed.
+# Leaving WINEARCH unset defaults to a 64-bit prefix, which runs BOTH
+# 32- and 64-bit Windows binaries (the reverse doesn't hold) — a strict
+# superset, so this is correct regardless of which architecture any given
+# broker's installer/terminal turns out to be.
 export WINEPREFIX=~/.wine-mt4
 wineboot --init
 ```
