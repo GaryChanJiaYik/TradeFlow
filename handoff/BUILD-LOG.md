@@ -5,9 +5,9 @@
 
 ## Current Status
 
-**Active step:** Step 11 — code-complete, locally verified (Supabase side only), NOT yet deployed. MQL4 EA/VPS side entirely unverified — see Step History.
+**Active step:** Step 11 — Supabase side DEPLOYED and confirmed ACTIVE (2026-09-16). VPS provider switched from OCI to GCP (`ap-kulai-2` doesn't offer any Always-Free x86 shape — see Step History). MQL4 EA/VPS side still entirely unverified.
 **Last cleared:** Step 8 — 2026-09-11 (deployed and verified live).
-**Blocked on:** Step 11's real-world completion is gated on the owner: provisioning the OCI VPS, compiling `mt4/TradeFlowMt4Bridge.mq4` for the first time, and the several GUI-only MT4 setup steps in `mt4/README.md` — none of which can be done from this session. The Supabase-side code (migration, `mt4-webhook`, `tick-fast`'s fallback gate) is ready to deploy independently of that and doesn't regress anything if the VPS/EA never materializes (falls back to today's Binance-only behavior).
+**Blocked on:** Step 11's real-world completion is gated on the owner: provisioning the GCP e2-micro VPS, compiling `mt4/TradeFlowMt4Bridge.mq4` for the first time, and the several GUI-only MT4 setup steps in `mt4/README.md` — none of which can be done from this session. The deployed Supabase-side code doesn't regress anything if the VPS/EA never materializes (falls back to today's Binance-only behavior).
 
 ### Known Gaps
 - **KG-16** — An unexplained `"workspaces": ["apps/*", "packages/*"]` field has now appeared in root `package.json` three separate times across three different Bob sessions (Step 7's build, Step 8's build, this fix round was clean), always byte-identical, always reverted before commit. Harmless (pnpm ignores this field entirely — it's the npm/yarn workspaces convention), but the recurrence across independent sessions suggests some tool invoked during a Bob session (candidate: a `deno check`/`deno run` command executed from the repo root rather than scoped into `supabase/functions`, which also produced a stray root-level `deno.lock` this same session, deleted before commit) is auto-adding it, though this hasn't been confirmed. Worth investigating properly if it keeps recurring; not blocking any step so far.
@@ -181,12 +181,37 @@ after — no real project touched):**
   end-to-end fill notification has fired — all of `mt4/README.md`'s manual/GUI steps
   are unexercised.
 
-Deploy: NOT deployed. `0007_mt4_webhook.sql` needs manual application via the
-dashboard SQL Editor (KG-8). `mt4-webhook` needs `supabase functions deploy
-mt4-webhook` (config.toml's `verify_jwt = false` for it is already committed) plus
-`MT4_WEBHOOK_SECRET`/`MT4_WEBHOOK_USER_ID` secrets set first. `tick-fast` needs
-redeploying for its fallback-gate change to take effect. The VPS/EA side is entirely
-owner-executed per `mt4/README.md` — nothing there can be done from this session.
+Deploy: Supabase side is DEPLOYED (2026-09-16) — `0007_mt4_webhook.sql` applied via
+the dashboard SQL Editor, `MT4_WEBHOOK_SECRET`/`MT4_WEBHOOK_USER_ID` secrets set,
+`mt4-webhook` (confirmed `ACTIVE`, `verify_jwt: false` — the config.toml setting took
+effect correctly) and `tick-fast` (confirmed `ACTIVE`) both redeployed via
+`supabase functions deploy`. Real end-to-end behavior (a live TMGM tick actually
+reaching the webhook) is still untested — that's gated on the VPS/EA below. The
+VPS/EA side is entirely owner-executed per `mt4/README.md`.
+
+### Update — 2026-09-16: OCI dropped, switched to GCP for the VPS
+
+Owner tried to provision the OCI VPS as planned and hit a real regional gap, not a
+capacity queue: `oci compute shape list` against the owner's actual tenancy in
+`ap-kulai-2` (Malaysia West 2/Kulai — a brand-new OCI region) returned only
+`BM.Standard.E5.192`, `BM.Standard3.64`, `VM.Standard.A1.Flex`, `VM.Standard3.Flex`,
+`VM.Standard.E5.Flex`, `VM.Standard.A4.Flex` — every one either a paid shape or (for
+`A1.Flex`) the wrong CPU architecture for reliable Wine. `VM.Standard.E2.1.Micro`
+(the shape this step's design depended on) is not offered in this region at all;
+Oracle's own docs still list it as Always Free tier-wide, but a new region can launch
+without every legacy shape family's hardware deployed. This can't be waited out —
+verified by asking OCI's own API directly, not by guessing from console UI behavior.
+
+**Resolution: switched to GCP's `e2-micro`** (also genuinely Always Free, real
+x86_64, no such regional gap — its only constraint is a fixed choice of three US
+regions, `us-west1`/`us-central1`/`us-east1`, which doesn't matter for this
+price-tick/fill-event use case). No TradeFlow code changed — the webhook design was
+always provider-agnostic. Updated `mt4/README.md`'s provisioning section
+(`gcloud compute instances create` instead of OCI's console/CLI steps, `pd-standard`
+30GB boot disk to stay inside the free allowance, `gcloud compute scp`/`ssh` in place
+of raw `scp`/`ssh`) — the rest of the runbook (Wine/Xvfb install, TMGM MT4 install,
+EA compile/attach, WebRequest allow-list, Supabase secrets) is identical regardless
+of cloud provider and was left unchanged.
 
 ### Known Gaps (added from Step 11)
 - **KG-17** — `TradeFlowMt4Bridge.mq4` is unverified (see above) — the single

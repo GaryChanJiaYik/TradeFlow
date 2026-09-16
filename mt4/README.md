@@ -1,10 +1,21 @@
 # MT4/TMGM Live-Tick Bridge — VPS Setup (Step 11)
 
-Runs MT4 + `TradeFlowMt4Bridge.mq4` (this directory) on a free Oracle Cloud
-Infrastructure VPS, so TradeFlow's `mt4-webhook` Edge Function gets real
-TMGM broker ticks and order-fill events. See
-`handoff/ARCHITECT-BRIEF.md`'s Step 11 for the full design/decisions this
-runbook implements.
+Runs MT4 + `TradeFlowMt4Bridge.mq4` (this directory) on a free VPS, so
+TradeFlow's `mt4-webhook` Edge Function gets real TMGM broker ticks and
+order-fill events. See `handoff/ARCHITECT-BRIEF.md`'s Step 11 for the full
+design/decisions this runbook implements.
+
+**Provider: Google Cloud Platform (e2-micro), not Oracle Cloud.** OCI was
+tried first, but its free-forever x86 shape (`VM.Standard.E2.1.Micro`) is
+not offered at all in every region — confirmed via `oci compute shape list`
+against a real tenancy in `ap-kulai-2` (Malaysia West 2/Kulai), which only
+lists paid shapes plus the ARM `VM.Standard.A1.Flex`. ARM was ruled out
+separately (Wine-on-ARM needs an unreliable x86-emulation layer, unsuitable
+for anything order-fill-alert-adjacent). GCP's `e2-micro` is real x86_64,
+genuinely Always Free, with no such regional gap — the only constraint is
+it must be created in one of three specific regions (see below), which
+doesn't matter for this use case (price ticks + fill events, not
+latency-sensitive scalping).
 
 Steps marked **(manual)** need a GUI/VNC session — no scriptable path
 exists for them (confirmed during design research). Everything else is a
@@ -12,15 +23,31 @@ shell command you can run over plain SSH.
 
 ## 1. Provision the VPS
 
-1. Create an Oracle Cloud (OCI) "Always Free" account.
-2. Create a compute instance: shape **`VM.Standard.E2.1.Micro`** (AMD,
-   x86_64 — required for Wine; OCI's bigger free ARM Ampere shape does NOT
-   work reliably here), image **Ubuntu 22.04 LTS**.
-3. Only open inbound **SSH (22)** in the security list — this VPS never
-   receives calls, it only makes outbound `WebRequest()` calls to Supabase.
-   Don't expose VNC (5900) directly; tunnel it over SSH when you need it:
+1. Create/use a Google Cloud Platform account and project (the Always Free
+   tier needs a billing account attached for verification, but an e2-micro
+   kept within the free-tier limits below is not charged).
+2. Create a compute instance:
    ```
-   ssh -L 5900:localhost:5900 ubuntu@<vps-ip>
+   gcloud compute instances create tradeflow-mt4-bridge \
+     --zone=us-west1-b \
+     --machine-type=e2-micro \
+     --image-family=ubuntu-2204-lts \
+     --image-project=ubuntu-os-cloud \
+     --boot-disk-size=30GB \
+     --boot-disk-type=pd-standard
+   ```
+   `--zone` must be in **`us-west1`, `us-central1`, or `us-east1`** — Always
+   Free e2-micro only applies in those three regions, regardless of where
+   you actually are. `--boot-disk-type=pd-standard` (not `pd-ssd`) and
+   `--boot-disk-size=30GB` matter too — that's the exact free persistent-disk
+   allowance; going over either dimension starts incurring real charges.
+3. Only open inbound **SSH (22)** — this VPS never receives calls, it only
+   makes outbound `WebRequest()` calls to Supabase (GCP's default network
+   usually already allows SSH via the `default-allow-ssh` firewall rule;
+   confirm with `gcloud compute firewall-rules list`). Don't expose VNC
+   (5900) directly; tunnel it over SSH when you need it:
+   ```
+   gcloud compute ssh tradeflow-mt4-bridge --zone=us-west1-b -- -L 5900:localhost:5900
    ```
 4. Add a swap file (cheap mitigation for the free tier's 1GB RAM, which is
    below the ~2GB community-recommended minimum for stable Wine+MT4):
@@ -81,7 +108,8 @@ export DISPLAY=:99
 ## 4. Compile and deploy the EA
 
 ```bash
-scp mt4/TradeFlowMt4Bridge.mq4 ubuntu@<vps-ip>:~/.wine-mt4/drive_c/.../MQL4/Experts/
+gcloud compute scp mt4/TradeFlowMt4Bridge.mq4 \
+  tradeflow-mt4-bridge:~/.wine-mt4/drive_c/.../MQL4/Experts/ --zone=us-west1-b
 ```
 
 Compile via MetaEditor's CLI (path depends on where MT4 installed):
