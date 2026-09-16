@@ -45,10 +45,25 @@ shell command you can run over plain SSH.
    makes outbound `WebRequest()` calls to Supabase (GCP's default network
    usually already allows SSH via the `default-allow-ssh` firewall rule;
    confirm with `gcloud compute firewall-rules list`). Don't expose VNC
-   (5900) directly; tunnel it over SSH when you need it:
+   (5900) directly; use `x11vnc` bound to localhost, sharing the same
+   Xvfb `:99` display everything else in this runbook uses (install it
+   alongside Xvfb in step 2), and tunnel it over SSH when you need it:
+   ```bash
+   # On the VPS, in its own session — leave it running in the background:
+   sudo apt install -y x11vnc
+   x11vnc -display :99 -nopw -localhost -forever &
    ```
+   ```bash
+   # On your local machine, in a separate terminal:
    gcloud compute ssh tradeflow-mt4-bridge --zone=us-west1-b -- -L 5900:localhost:5900
    ```
+   Then point a VNC **viewer** app (e.g. TigerVNC Viewer — not a browser) at
+   `localhost:5900`. `-nopw -localhost` is deliberate: it only accepts
+   connections originating on the VPS itself, so the SSH tunnel above is the
+   only way in — never run `x11vnc` without `-localhost` (or with a real
+   password if you drop `-localhost`), since that would expose an
+   unauthenticated remote desktop to the internet on a box whose whole
+   security model is "nothing listens except SSH."
 4. Add a swap file (cheap mitigation for the free tier's 1GB RAM, which is
    below the ~2GB community-recommended minimum for stable Wine+MT4):
    ```bash
