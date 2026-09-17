@@ -5,7 +5,7 @@
 
 ## Current Status
 
-**Active step:** Step 11 — Supabase side DEPLOYED and confirmed ACTIVE (2026-09-16). VPS provider switched from OCI to GCP (`ap-kulai-2` doesn't offer any Always-Free x86 shape — see Step History). MQL4 EA/VPS side still entirely unverified.
+**Active step:** Step 11 — LIVE end-to-end for the price-tick path (2026-09-17). GCP `e2-micro` VPS running MT4 + the EA as a systemd service (`mt4.service`), `price_source` confirmed flipping to `'MT4'` with live ticks in production. ORDER_FILLED path still needs a real order-fill test. See KG-17's resolution in Step History.
 **Last cleared:** Step 8 — 2026-09-11 (deployed and verified live).
 **Blocked on:** Step 11's real-world completion is gated on the owner: provisioning the GCP e2-micro VPS, compiling `mt4/TradeFlowMt4Bridge.mq4` for the first time, and the several GUI-only MT4 setup steps in `mt4/README.md` — none of which can be done from this session. The deployed Supabase-side code doesn't regress anything if the VPS/EA never materializes (falls back to today's Binance-only behavior).
 
@@ -214,10 +214,25 @@ EA compile/attach, WebRequest allow-list, Supabase secrets) is identical regardl
 of cloud provider and was left unchanged.
 
 ### Known Gaps (added from Step 11)
-- **KG-17** — `TradeFlowMt4Bridge.mq4` is unverified (see above) — the single
-  biggest risk in this step. Not blocking the Supabase-side code (which is fully
-  locally verified independent of the EA), but the feature delivers nothing real
-  until the owner compiles, attaches, and soak-tests it.
+- **KG-17 — RESOLVED 2026-09-17.** `TradeFlowMt4Bridge.mq4` compiled and is running
+  for real on the owner's GCP `e2-micro` VPS, attached to a live TMGM XAUUSD chart.
+  End-to-end verified against the real, deployed system (not a mock): `instruments`
+  showed `price_source = 'MT4'` with `mt4_last_seen_at` advancing every few seconds
+  while the EA was live. A real-world resilience gap surfaced and was fixed along the
+  way: MT4 was initially launched as a plain foreground process inside a Google Cloud
+  Shell SSH session; when that session dropped (Cloud Shell is designed to time out —
+  not a fluke), MT4 died with it, and `tick-fast`'s freshness gate correctly fell back
+  to `price_source = 'BINANCE'` within its 25s window — the fallback design worked
+  exactly as intended, with zero alert-coverage gap. Root-caused and fixed by wrapping
+  MT4 in a proper systemd unit (`mt4.service`, `Restart=on-failure`, `enable`d for
+  boot-persistence, `After=xvfb.service`) instead of relying on any interactive
+  session staying open. Re-verified after the fix: `systemctl status mt4.service`
+  shows `active (running)`, and the DB flipped back to `price_source = 'MT4'` with
+  fresh `mt4_last_seen_at` timestamps, confirmed independent of any SSH/VNC session
+  still being open. `mt4/README.md` updated with the concrete `mt4.service` unit.
+  **Still not verified:** the `ORDER_FILLED` path end-to-end with a real order fill
+  (only `PRICE_TICK` has been proven live so far) — worth a real small-order test
+  before trusting the order-fill-alert half of this feature.
 - **KG-18** — No automated test coverage for `mt4-webhook`'s payload
   parsing/auth logic (no unit tests added — this project's Deno Edge Functions have
   none today, verified only via the `deno run`-against-a-local-stack pattern used
