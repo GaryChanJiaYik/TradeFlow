@@ -5,8 +5,8 @@
 
 ## Current Status
 
-**Active step:** Step 11 — LIVE end-to-end for the price-tick path (2026-09-17). GCP `e2-micro` VPS running MT4 + the EA as a systemd service (`mt4.service`), `price_source` confirmed flipping to `'MT4'` with live ticks in production. ORDER_FILLED path still needs a real order-fill test. See KG-17's resolution in Step History.
-**Last cleared:** Step 8 — 2026-09-11 (deployed and verified live).
+**Active step:** none — Step 11 CLEARED and LIVE (2026-09-17), both paths verified end-to-end in production (real price ticks via `mt4.service` on GCP; a real order fill triggered a real push notification, with every SSH/VNC/Cloud Shell session closed).
+**Last cleared:** Step 11 — 2026-09-17 (deployed and verified live).
 **Blocked on:** Step 11's real-world completion is gated on the owner: provisioning the GCP e2-micro VPS, compiling `mt4/TradeFlowMt4Bridge.mq4` for the first time, and the several GUI-only MT4 setup steps in `mt4/README.md` — none of which can be done from this session. The deployed Supabase-side code doesn't regress anything if the VPS/EA never materializes (falls back to today's Binance-only behavior).
 
 ### Known Gaps
@@ -66,7 +66,7 @@ zero dependency on the owner's laptop, browser, or any running local process.
 
 ## Step History
 
-### Step 11 — MT4/TMGM live-tick bridge + order-fill alerts — Status: code-complete, verified locally against a throwaway `supabase start` stack; NOT yet deployed. MQL4 EA and VPS runbook written but explicitly UNVERIFIED (no MetaEditor/MT4 terminal available in this environment)
+### Step 11 — MT4/TMGM live-tick bridge + order-fill alerts — Status: LIVE and verified end-to-end in production (2026-09-17) — both PRICE_TICK and ORDER_FILLED paths proven with real TMGM activity, fully independent of any session
 *Date: 2026-09-15*
 
 Trigger: owner trades XAUUSD on MT4 (broker TMGM) and wants the real broker price as
@@ -230,9 +230,11 @@ of cloud provider and was left unchanged.
   shows `active (running)`, and the DB flipped back to `price_source = 'MT4'` with
   fresh `mt4_last_seen_at` timestamps, confirmed independent of any SSH/VNC session
   still being open. `mt4/README.md` updated with the concrete `mt4.service` unit.
-  **Still not verified:** the `ORDER_FILLED` path end-to-end with a real order fill
-  (only `PRICE_TICK` has been proven live so far) — worth a real small-order test
-  before trusting the order-fill-alert half of this feature.
+  **`ORDER_FILLED` path also verified live, 2026-09-17**: owner closed every SSH/VNC/
+  Cloud Shell session, then placed a real market order on TMGM — a push notification
+  arrived. Both halves of Step 11 (real-time price + order-fill alerts) are now
+  proven working end-to-end in production, fully independent of any session. Step 11
+  is complete.
 - **KG-18** — No automated test coverage for `mt4-webhook`'s payload
   parsing/auth logic (no unit tests added — this project's Deno Edge Functions have
   none today, verified only via the `deno run`-against-a-local-stack pattern used
