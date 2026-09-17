@@ -6,7 +6,8 @@
 // `isMt4Fresh` below and handoff/ARCHITECT-BRIEF.md's Step 11. Otherwise it
 // falls back to Binance's public PAXG/USDT ticker (no further fallback below
 // that — see Step 8), corrects it against real spot gold using the basis
-// `tick` calibrates every 2 minutes from chartgoldprice.com (Step 9 — see
+// `tick` calibrates every 2 minutes from goldprice.dev (Step 9, source
+// swapped from chartgoldprice.com in Step 12 — see
 // packages/alert-engine/src/priceBasis.ts), evaluates the corrected price
 // against every enabled/unexpired price_alerts row, sends Web Push
 // notifications for anything that fires, and unconditionally updates
@@ -103,7 +104,8 @@ Deno.serve(async (_req: Request) => {
 
     // Step 9: correct the raw Binance PAXG price for its drifting
     // premium/discount against real spot gold, using the basis `tick`
-    // calibrates every 2 minutes from chartgoldprice.com (see
+    // calibrates every 2 minutes from goldprice.dev (source swapped from
+    // chartgoldprice.com in Step 12 — see
     // packages/alert-engine/src/priceBasis.ts and handoff/ARCHITECT-BRIEF.md
     // Step 9). `instrument.price_basis` is null until that first
     // calibration lands, in which case this is a no-op (raw price used

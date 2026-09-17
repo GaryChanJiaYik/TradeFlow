@@ -1,23 +1,31 @@
-// TradeFlow — shared Web Push / notification-log helpers used by both the
-// "tick" (reminders + chartgoldprice accuracy check) and "tick-fast"
-// (price alerts) Edge Functions. Extracted byte-for-byte out of the
-// pre-Step-8 `tick/index.ts` (see handoff/ARCHITECT-BRIEF.md's Step 8) — a
-// mechanical move, not a rewrite, so both functions share one copy of this
-// logic instead of drifting apart.
+// TradeFlow — shared Web Push / notification-log helpers used by "tick"
+// (reminders + price-basis calibration), "tick-fast" (price alerts), and
+// "mt4-webhook" (MT4-sourced ticks + order fills) Edge Functions. Extracted
+// byte-for-byte out of the pre-Step-8 `tick/index.ts` (see
+// handoff/ARCHITECT-BRIEF.md's Step 8) — a mechanical move, not a rewrite,
+// so all functions share one copy of this logic instead of drifting apart.
 import type { SupabaseClient } from "npm:@supabase/supabase-js@2.45.4";
 import webpush from "npm:web-push@3.6.7";
 import type { Device, NotificationEventType } from "@tradeflow/types";
 import { BinanceProviderError } from "../../../packages/market-data/src/binanceProvider.ts";
 import { ChartGoldPriceProviderError } from "../../../packages/market-data/src/chartGoldPriceProvider.ts";
+import { GoldPriceDevProviderError } from "../../../packages/market-data/src/goldPriceDevProvider.ts";
 
 /**
  * Formats one provider-level error for a function's response summary.
  * Handles both typed provider errors (with a `.code`) and anything else
  * that bubbled up unexpectedly, so a real failure always logs something
- * actionable instead of an opaque `[object Object]`. Step 7.
+ * actionable instead of an opaque `[object Object]`. Step 7 (Step 12 added
+ * GoldPriceDevProviderError; ChartGoldPriceProviderError kept recognized
+ * even though nothing throws it in the active path today — same
+ * leave-it-in-place convention as the provider itself).
  */
 export function describeProviderError(err: unknown): string {
-  if (err instanceof ChartGoldPriceProviderError || err instanceof BinanceProviderError) {
+  if (
+    err instanceof ChartGoldPriceProviderError ||
+    err instanceof BinanceProviderError ||
+    err instanceof GoldPriceDevProviderError
+  ) {
     return `${err.code}: ${err.message}`;
   }
   return err instanceof Error ? err.message : String(err);

@@ -1,9 +1,9 @@
 // TradeFlow — "tick" Edge Function (Deno). Invoked every 2 minutes by
 // pg_cron (see supabase/migrations/0003_cron.sql) via pg_net. Per
 // invocation: evaluates due graph_reminders and sends Web Push
-// notifications for anything that fires, and runs a read-only
-// chartgoldprice.com accuracy check against the Binance baseline that
-// `tick-fast` maintains (see handoff/ARCHITECT-BRIEF.md's Step 8).
+// notifications for anything that fires, and calibrates a price basis
+// against a fresh Binance read using goldprice.dev as the reference (Step
+// 12 — see handoff/ARCHITECT-BRIEF.md's Step 8/9/12).
 //
 // As of Step 8, price-alert evaluation and the instruments.last_price/
 // last_price_at write have moved to the new `tick-fast` Edge Function
@@ -29,7 +29,7 @@
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.45.4";
 import type { GraphReminder, Instrument } from "@tradeflow/types";
 import { BinanceProvider } from "../../../packages/market-data/src/binanceProvider.ts";
-import { ChartGoldPriceProvider } from "../../../packages/market-data/src/chartGoldPriceProvider.ts";
+import { GoldPriceDevProvider } from "../../../packages/market-data/src/goldPriceDevProvider.ts";
 import { computeNextTriggerAt } from "../../../packages/alert-engine/src/computeNextTriggerAt.ts";
 import { computePriceBasis } from "../../../packages/alert-engine/src/priceBasis.ts";
 import {
@@ -135,25 +135,34 @@ async function processGraphReminders(
 }
 
 /**
- * Step 8 added this as a routine, read-only accuracy check. Step 9 extends
+ * Step 8 added this as a routine, read-only accuracy check. Step 9 extended
  * it to also *apply* the result: `tick-fast` prices XAUUSD off Binance's
  * PAXG/USDT ticker, which trades at its own drifting premium/discount
- * ("basis") to real spot gold — this was flagged but left uncorrected back
- * in the Step 2 revision, and turned out to matter enough (owner-reported
- * mismatch against TradingView) to fix. Every 2 minutes: fetch a *fresh*
- * raw Binance price (independent of `instruments.last_price`, which — as of
- * Step 9 — is itself basis-corrected by `tick-fast` and so is no longer a
- * pure raw baseline to compare against) and chartgoldprice.com's quote,
- * compute the offset between them, and write it to
+ * ("basis") to real spot gold. Step 12 swaps the reference source from
+ * chartgoldprice.com to goldprice.dev — chartgoldprice.com was observed
+ * stale for 8+ hours at a time on three separate occasions in this
+ * project's history (see handoff/BUILD-LOG.md), while goldprice.dev is
+ * keyless (no fallback-quota problem like Step 10's reverted GoldAPI.io
+ * attempt), rate-limited generously (100/hour vs. this function's 30/hour
+ * usage), and self-reports freshness via `is_stale`.
+ * `ChartGoldPriceProvider` is left in place, unused (same convention as
+ * `OANDAProvider`/`FallbackMarketDataProvider`).
+ *
+ * Every 2 minutes: fetch a *fresh* raw Binance price (independent of
+ * `instruments.last_price`, which may be MT4-sourced as of Step 11 and so
+ * is not a pure raw Binance baseline to compare against) and goldprice.dev's
+ * quote, compute the offset between them, and write it to
  * `instruments.price_basis`/`price_basis_at` if it passes a sanity bound
  * (see packages/alert-engine/src/priceBasis.ts) — an outlier reading is
  * logged and skipped, leaving the previous basis in place, rather than
- * letting one bad chartgoldprice response swing the live alert price.
- * `tick` remains the sole writer of `price_basis`/`price_basis_at`, mirroring
- * `tick-fast`'s sole ownership of `last_price`/`last_price_at` — never both
- * from the same function.
+ * letting one bad reading swing the live alert price. `tick` remains the
+ * sole writer of `price_basis`/`price_basis_at`, mirroring `tick-fast`'s
+ * sole ownership of `last_price`/`last_price_at` — never both from the same
+ * function. (This basis only feeds Binance's price — as of Step 11, MT4 is
+ * the primary source and never has this correction applied, since it's
+ * already the real broker price the correction exists to approximate.)
  */
-async function checkChartGoldPriceAccuracy(
+async function checkPriceBasisAccuracy(
   supabase: SupabaseClient,
 ): Promise<Record<string, unknown>> {
   const { data: instrument, error: instrumentError } = await supabase
@@ -168,20 +177,20 @@ async function checkChartGoldPriceAccuracy(
   }
 
   try {
-    const [chartGoldPrice, rawBinance] = await Promise.all([
-      new ChartGoldPriceProvider().getPrice(XAUUSD_SYMBOL),
+    const [goldPriceDev, rawBinance] = await Promise.all([
+      new GoldPriceDevProvider().getPrice(XAUUSD_SYMBOL),
       new BinanceProvider().getPrice(XAUUSD_SYMBOL),
     ]);
 
-    const basisResult = computePriceBasis(chartGoldPrice.price, rawBinance.price);
+    const basisResult = computePriceBasis(goldPriceDev.price, rawBinance.price);
 
     if (basisResult.rejected) {
       console.error(
-        `chartgoldprice.com accuracy check: basis update skipped — ${basisResult.reason} ` +
-          `(chartgoldprice=${chartGoldPrice.price}, rawBinance=${rawBinance.price})`,
+        `Price basis accuracy check: basis update skipped — ${basisResult.reason} ` +
+          `(goldPriceDev=${goldPriceDev.price}, rawBinance=${rawBinance.price})`,
       );
       return {
-        chartGoldPrice: chartGoldPrice.price,
+        goldPriceDev: goldPriceDev.price,
         rawBinance: rawBinance.price,
         deltaPct: basisResult.deltaPct,
         basisUpdated: false,
@@ -200,13 +209,13 @@ async function checkChartGoldPriceAccuracy(
     }
 
     console.log(
-      `chartgoldprice.com accuracy check: chartgoldprice=${chartGoldPrice.price}, ` +
+      `Price basis accuracy check: goldPriceDev=${goldPriceDev.price}, ` +
         `rawBinance=${rawBinance.price}, basis=${basisResult.basis.toFixed(4)} ` +
         `(${basisResult.deltaPct.toFixed(4)}%)`,
     );
 
     return {
-      chartGoldPrice: chartGoldPrice.price,
+      goldPriceDev: goldPriceDev.price,
       rawBinance: rawBinance.price,
       basis: basisResult.basis,
       deltaPct: basisResult.deltaPct,
@@ -214,7 +223,7 @@ async function checkChartGoldPriceAccuracy(
     };
   } catch (err) {
     const reason = describeProviderError(err);
-    console.error(`chartgoldprice.com accuracy check skipped: ${reason}`);
+    console.error(`Price basis accuracy check skipped: ${reason}`);
     return { skipped: true, reason };
   }
 }
@@ -239,10 +248,9 @@ Deno.serve(async (_req: Request) => {
     summary.graphReminders = { skipped: true, reason: String(err) };
   }
 
-  // --- chartgoldprice.com accuracy check: read-only, routine observability
-  // only (see handoff/ARCHITECT-BRIEF.md's Step 8). Never writes
-  // instruments. ---
-  summary.chartGoldPriceCheck = await checkChartGoldPriceAccuracy(supabase);
+  // --- Price basis calibration against goldprice.dev (Step 12). Writes
+  // only instruments.price_basis/price_basis_at — never last_price. ---
+  summary.priceBasisCheck = await checkPriceBasisAccuracy(supabase);
 
   return new Response(JSON.stringify(summary), {
     headers: { "content-type": "application/json" },

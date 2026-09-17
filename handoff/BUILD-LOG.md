@@ -5,7 +5,7 @@
 
 ## Current Status
 
-**Active step:** none — Step 11 CLEARED and LIVE (2026-09-17), both paths verified end-to-end in production (real price ticks via `mt4.service` on GCP; a real order fill triggered a real push notification, with every SSH/VNC/Cloud Shell session closed).
+**Active step:** Step 12 — code-complete, locally verified with a real live goldprice.dev + Binance call, NOT yet deployed. Just needs `supabase functions deploy tick` (no migration).
 **Last cleared:** Step 11 — 2026-09-17 (deployed and verified live).
 **Blocked on:** Step 11's real-world completion is gated on the owner: provisioning the GCP e2-micro VPS, compiling `mt4/TradeFlowMt4Bridge.mq4` for the first time, and the several GUI-only MT4 setup steps in `mt4/README.md` — none of which can be done from this session. The deployed Supabase-side code doesn't regress anything if the VPS/EA never materializes (falls back to today's Binance-only behavior).
 
@@ -65,6 +65,76 @@ zero dependency on the owner's laptop, browser, or any running local process.
 ---
 
 ## Step History
+
+### Step 12 — Replace chartgoldprice.com with goldprice.dev as tick's calibration reference — Status: code-complete, verified locally with a real live call; NOT yet deployed
+*Date: 2026-09-17*
+
+Trigger: with Step 11 live, owner asked to re-check chartgoldprice.com's staleness
+(now only affects the Binance-fallback calibration, since MT4 is primary). Checked:
+still stale — 559.5 minutes old, confirmed via cache-busted fetch (`X-Vercel-Cache:
+MISS`, ruling out a caching artifact). This is the **third** time in this project's
+history chartgoldprice.com was found stale for many hours, making it a confirmed
+chronic pattern rather than an occasional outage.
+
+Researched alternatives. Found and verified live: **goldprice.dev**
+(`api.goldprice.dev` — a separate subdomain from the marketing site; an initial guess
+at the marketing site's own domain 404'd, corrected by reading the real docs page).
+Keyless, no signup, 100 requests/hour/IP (vs. `tick`'s 30/hour usage), self-reports
+freshness via `is_stale` + `computed_at`. Live-verified at research time:
+`computed_at` was ~1 second old. Already indirectly vetted once before in this
+project (Step 2 revision re-verified it, rejected only for being too slow for the
+old 10-second hot path — irrelevant for a 2-minute calibration cadence). Owner chose
+full replacement over adding it as a second fallback source, given goldprice.dev's
+keyless design removes the exact quota problem that sank Step 10's GoldAPI.io
+attempt.
+
+Files changed:
+- `packages/market-data/src/goldPriceDevProvider.ts` (new) — `GoldPriceDevProvider`,
+  mirrors `ChartGoldPriceProvider`'s exact shape (typed `GoldPriceDevProviderError`,
+  `fetchFn`/`now` injection). Staleness check: trusts `is_stale` primarily, but also
+  independently checks `computed_at` age against a 5-minute backstop — never trust
+  one external signal blindly, matching this codebase's existing pattern from
+  `ChartGoldPriceProvider` itself.
+- `packages/market-data/src/__tests__/goldPriceDevProvider.test.ts` (new, 12 cases,
+  mocked `fetch`) — success, network/HTTP/JSON errors, missing/non-numeric price,
+  `is_stale: true` even with a fresh `computed_at`, missing/stale `computed_at` even
+  with `is_stale: false`, boundary (exactly 5 minutes), default-fetch construction.
+- `packages/market-data/src/index.ts` — added the new export. `ChartGoldPriceProvider`
+  left in place, unused — same convention as `OANDAProvider`/`FallbackMarketDataProvider`.
+- `supabase/functions/tick/index.ts` — `checkChartGoldPriceAccuracy` renamed to
+  `checkPriceBasisAccuracy` (the function's job hasn't changed, only the source; the
+  old name was source-specific). `ChartGoldPriceProvider` swapped for
+  `GoldPriceDevProvider`; log lines and the summary key (`chartGoldPriceCheck` ->
+  `priceBasisCheck`) updated to match — purely observability-facing, not consumed
+  elsewhere, so free to rename.
+- `supabase/functions/tick-fast/index.ts` — comments referencing chartgoldprice.com
+  as the basis's source updated to goldprice.dev (the code itself was untouched;
+  `tick-fast` only reads `instruments.price_basis`, it never calls either provider
+  directly).
+- `supabase/functions/_shared/notifications.ts` — `describeProviderError` gains
+  `GoldPriceDevProviderError` recognition alongside the existing
+  `ChartGoldPriceProviderError`/`BinanceProviderError`.
+
+**Local verification performed (throwaway `supabase start` Docker stack, torn down
+after — no real project touched):**
+- `pnpm build`/`test`/`typecheck` — all green (new `goldPriceDevProvider.test.ts`:
+  12/12; `market-data` package total 37/37). `deno check` clean on `tick/index.ts`,
+  `tick-fast/index.ts`, `mt4-webhook/index.ts`.
+- Ran `tick` for real (via a temporary, non-committed port-8321 copy) against
+  **live** goldprice.dev and Binance — no mocking needed, fully keyless, zero quota
+  risk either way. Result: `goldPriceDev=4305.24, rawBinance=4308.19,
+  basis=-2.9500 (-0.0685%)` — a small, sane basis, notably more plausible than any
+  chartgoldprice-derived delta this project ever logged, since both readings were
+  genuinely simultaneous this time rather than one being hours stale. Confirmed the
+  write landed: `instruments.price_basis = -2.9499...`, `price_basis_at` set to the
+  request time.
+- Deleted the temporary local-verify file before finishing; `git status` confirmed
+  only the intended files changed.
+
+Deploy: NOT deployed yet. No migration needed (reuses Step 9's `price_basis`/
+`price_basis_at` columns) — just `supabase functions deploy tick`.
+
+---
 
 ### Step 11 — MT4/TMGM live-tick bridge + order-fill alerts — Status: LIVE and verified end-to-end in production (2026-09-17) — both PRICE_TICK and ORDER_FILLED paths proven with real TMGM activity, fully independent of any session
 *Date: 2026-09-15*

@@ -4,140 +4,89 @@
 
 ---
 
-## Step 11 — MT4/TMGM live-tick bridge + order-fill alerts
+## Step 12 — Replace chartgoldprice.com with goldprice.dev as tick's calibration reference
 
-Owner trades XAUUSD on MT4 with broker TMGM and found TradeFlow's price (Binance
-PAXG/USDT, calibrated against chartgoldprice.com) doesn't match what they actually
-trade at. Explored and rejected this session: GoldAPI.io (tried, then reverted —
-owner judged it unreliable), Forex.com's API (needs an actual funded/demo account
-plus multi-day manual approval — the same wall already hit with OANDA/Capital.com/
-Deriv in the Step 2 revision), TMGM's own free-VPS perk (needs 7 lots/month or a
-$3,000 deposit, which the owner doesn't meet).
+chartgoldprice.com (Step 9's calibration reference for Binance's PAXG-vs-spot basis)
+was observed genuinely stale for 8+ hours at a time on three separate occasions
+across this project's history (confirmed each time via a cache-busted direct fetch —
+`X-Vercel-Cache: MISS`, ruling out a caching artifact). This is now a confirmed
+chronic pattern, not an occasional outage — which matters because it changes the
+calculus from Step 10 (GoldAPI.io was rejected as a *fallback* partly because a
+chronic-failure chartgoldprice would exhaust its 100/month keyed quota in hours).
 
-Landed on: a custom MQL4 EA on Oracle Cloud's free-forever `VM.Standard.E2.1.Micro`
-(x86_64, 1GB RAM — the only OCI/GCP free-tier shape that's both genuinely free and
-the right CPU architecture for Wine; OCI's bigger ARM Ampere free tier needs an
-unreliable extra emulation layer for Wine) pushes MT4's real, live tick to a new
-TradeFlow webhook. That becomes the **primary** source for `instruments.last_price`,
-with Binance polling in `tick-fast` staying as an automatic fallback — 1GB RAM is
-genuinely below the ~2GB community-recommended minimum for stable Wine+MT4, and this
-project has already been burned once this week by trusting an external source's
-uptime unconditionally (chartgoldprice.com). The EA also detects order fills (MT4 has
-no `OnTradeTransaction()`, unlike MT5 — must poll and diff `OrdersTotal()`) and pushes
-an immediate notification.
+With Step 11 live, chartgoldprice's role had already shrunk to calibrating only the
+Binance fallback path (MT4/TMGM is now primary), lowering the stakes of this fix —
+but a genuinely reliable, still-keyless replacement removes the problem outright
+rather than just accepting degraded fallback accuracy.
 
-This is the first *inbound* webhook TradeFlow will have — every existing Edge
-Function is either pg_cron-triggered (service-role-key bearer token, itself a valid
-project JWT) or a logged-in browser session under RLS. The MT4 EA has neither.
-
-Full reasoning is in the approved plan:
-`C:\Users\jychan\.claude\plans\this-is-my-project-nifty-mist.md`.
+Researched and verified live: **goldprice.dev** (`api.goldprice.dev`, a separate
+subdomain from its marketing site — the real endpoint, not guessed). Keyless, no
+signup. Free/anonymous tier: 100 requests/hour/IP, comfortably above `tick`'s 30/hour
+(2-minute cadence) usage. Self-reports freshness via an `is_stale` boolean plus a
+`computed_at` timestamp. Verified with a live call at design time: `computed_at` was
+~1 second old. Already indirectly vetted once before in this project (the Step 2
+revision re-verified it and rejected it only for being too slow for the old
+10-second hot path — irrelevant here, since calibration only needs ~60s-level
+freshness). One honest caveat: it's a new service ("Launched May 2026"), so it lacks
+chartgoldprice's longer (if apparently worthless) track record.
 
 ### Decisions
 
-- **One webhook endpoint, not two**, discriminated by `"type": "PRICE_TICK" |
-  "ORDER_FILLED"`. MT4's `WebRequest()` allow-list (Tools > Options > Expert
-  Advisors) is GUI-only with no scriptable path — every distinct URL is a manual
-  click-through step, so one URL beats two. New file:
-  `supabase/functions/mt4-webhook/index.ts`.
-- **`verify_jwt = false` required, easy to miss.** The EA has no project-signed JWT.
-  Added to `supabase/config.toml` (`[functions.mt4-webhook]` — the first
-  `[functions.*]` section this repo has needed). With it off, the shared secret is
-  the *only* auth layer for this function, not a second one.
-- **Auth**: `MT4_WEBHOOK_SECRET` Edge Function secret, checked via `x-webhook-secret`
-  header, plain `===` compare (no timing-attack defense needed for a personal app).
-  The function's own service-role client does the DB writes — the EA/VPS never holds
-  that key.
-- **Target user**: `MT4_WEBHOOK_USER_ID` env var (no logged-in session on an inbound
-  webhook to derive this from). A query-time "the one user" lookup was considered and
-  rejected — silently wrong forever if a second `auth.users` row ever appears, vs. a
-  fixed ID that fails loudly if unset and can never resolve to the wrong user.
-- **MT4-primary / Binance-fallback gate, in `tick-fast`**: a freshness check
-  (`isMt4Fresh`), not a try/catch — MT4 is a *push* source, `FallbackMarketDataProvider`'s
-  shape doesn't apply. New `instruments.mt4_last_seen_at` (written only by
-  `mt4-webhook`, using that function's own server clock, never the EA's self-reported
-  time) + `MT4_FRESHNESS_SECONDS` (default 25s: tick-fast runs every 10s, the EA
-  heartbeats every 5s, so 25s covers two consecutive missed heartbeats).
-- **Exactly one active evaluator at a time, not just one active writer.** When MT4 is
-  fresh, `tick-fast` skips its Binance fetch, alert evaluation, AND the `last_price`
-  write entirely — not just the write — so the same crossing is never evaluated twice
-  against two different price streams in the same window.
-- **No `applyPriceBasis()` on the MT4 path** — that correction compensates for
-  Binance's PAXG-vs-spot drift; MT4/TMGM's price is already the real broker price it
-  approximates.
-- **`processPriceAlerts` extracted** out of `tick-fast/index.ts` into
-  `supabase/functions/_shared/processPriceAlerts.ts` (moved verbatim, no logic
-  change) so both `tick-fast` and `mt4-webhook` share one evaluator. Lives beside
-  `_shared/notifications.ts`, not in `packages/alert-engine` — that package is
-  deliberately pure/I-O-free; this function is all I/O.
-- **No fill-ledger table, no server-side ticket-dedup** — the EA's own in-memory
-  ticket/type snapshot (rebuilt fully every poll, not incrementally patched — avoids
-  a known `OrdersTotal()`-unchanged-between-two-real-changes blind spot) is enough for
-  a personal account's order volume.
-- **Fill detection must catch orders not placed by this EA** (owner trades
-  manually/elsewhere) — polls and diffs `OrdersTotal()`/`OrderSelect(...,
-  MODE_TRADES)` every tick/timer regardless of origin. Exact transition tracked:
-  ticket → last-seen `OrderType()`, since a pending order triggering keeps its ticket
-  number (only the type changes) — a bare "is this ticket new" check would miss that
-  case.
-
-### Schema — `supabase/migrations/0007_mt4_webhook.sql`
-
-`instruments` gains `mt4_last_seen_at timestamptz` and `price_source text check
-(price_source in ('MT4','BINANCE')) default 'BINANCE'`. `notification_log`'s
-`event_type` check constraint gains `'ORDER_FILLED'`. Written here, applied manually
-via the dashboard SQL Editor per the existing KG-8 constraint (no `supabase db push`
-from this network). Documented rollback included, same convention as every prior
-migration.
+- **Full replacement, not an added fallback.** Simpler than a dual-source design
+  (which is what sank Step 10) since goldprice.dev is keyless and handles the full
+  2-minute cadence directly — no quota-conservation logic needed.
+- **New `packages/market-data/src/goldPriceDevProvider.ts`**, mirroring
+  `ChartGoldPriceProvider`'s exact shape (typed errors, `fetchFn`/`now` injection,
+  never propagate NaN/stale). Staleness check trusts the API's own `is_stale` flag
+  primarily, but ALSO independently checks `computed_at` age against a 5-minute
+  backstop threshold — never trust a single external signal blindly, matching this
+  codebase's existing pattern.
+- **`ChartGoldPriceProvider` left in place, unused** — same convention as
+  `OANDAProvider`/`FallbackMarketDataProvider`. Not deleted, not imported anywhere
+  in the active path.
+- **`tick/index.ts`**: `checkChartGoldPriceAccuracy` renamed to
+  `checkPriceBasisAccuracy` (the function's job — compute and write a basis — hasn't
+  changed, only the reference source; the old name was source-specific). Variable
+  names, log lines, and the returned summary key (`chartGoldPriceCheck` ->
+  `priceBasisCheck`) updated to match — these are purely observability-facing, not
+  consumed by any other code, so free to rename.
+- **`_shared/notifications.ts`**: `describeProviderError` gains recognition of
+  `GoldPriceDevProviderError` alongside the existing `ChartGoldPriceProviderError`/
+  `BinanceProviderError` — kept both since the shared formatter's job isn't scoped
+  to one caller's active path.
+- No schema change — reuses Step 9's `price_basis`/`price_basis_at` columns
+  unchanged.
 
 ### Build Order
-1. Extract `processPriceAlerts` to `_shared/processPriceAlerts.ts` (mechanical move).
-2. `0007_mt4_webhook.sql` + `packages/types` updates (`enums.ts`'s
-   `NotificationEventType`/new `PriceSource`, `instrument.ts`'s two new fields) +
-   `_shared/notifications.ts`'s `logNotification` type widening.
-3. `supabase/functions/mt4-webhook/index.ts` — build, then verify locally against a
-   throwaway `supabase start` stack: a `PRICE_TICK` payload updates
-   `last_price`/`mt4_last_seen_at`/`price_source` and fires a crafted crossing; an
-   `ORDER_FILLED` payload logs a push + `notification_log` row; bad-secret (401) and
-   malformed-body (400) paths both verified.
-4. `tick-fast/index.ts`'s `isMt4Fresh` gate — verify locally: a fresh
-   `mt4_last_seen_at` skips Binance entirely; a stale one (26s+) falls through
-   exactly as before.
-5. `supabase/config.toml`'s `[functions.mt4-webhook]` section — do not deploy without
-   it, or every request will be rejected before this function's own code runs.
-6. `mt4/TradeFlowMt4Bridge.mq4` + `mt4/README.md` (VPS runbook) — **not compiled or
-   tested against a real MetaEditor/MT4 terminal**, since none is available in this
-   environment. Flag this clearly; the owner must verify compilation and real-world
-   behavior on the actual VPS per the runbook's verification checklist.
-7. `handoff/BUILD-LOG.md` entry per this project's established process.
+1. `goldPriceDevProvider.ts` + tests (mirrors `chartGoldPriceProvider.test.ts`'s
+   exact structure: success, network/HTTP/JSON errors, missing/non-numeric price,
+   `is_stale: true` even with a fresh timestamp, missing/stale `computed_at` even
+   with `is_stale: false`, boundary case, default-fetch construction).
+2. Export from `packages/market-data/src/index.ts`.
+3. Rewire `tick/index.ts` (rename function, swap provider, update all
+   chartgoldprice-referencing comments in `tick/index.ts` AND `tick-fast/index.ts`,
+   since the latter's basis-application comments also named the old source).
+4. `_shared/notifications.ts`'s `describeProviderError` update.
+5. Local verification: real live call against goldprice.dev + Binance (no mocking
+   needed — fully keyless, zero quota risk) against a throwaway `supabase start`
+   stack, confirming a real basis computes and writes correctly.
+6. `handoff/BUILD-LOG.md` entry.
 
 ### Flags
-- Flag: `TradeFlowMt4Bridge.mq4` is unverified MQL4 — written carefully from
-  real MQL5/MQL4 community documentation (WebRequest signature, fill-detection
-  pattern, MetaEditor CLI quirks), but never compiled. Treat as a first draft the
-  owner must actually compile and soak-test, not proven-correct code.
-- Flag: the free VPS's 1GB RAM is a known, accepted risk (that's the entire reason
-  the Binance fallback exists) — do not treat an unstable EA connection as a bug to
-  fix by adding complexity; the fallback is the fix.
-- Flag: do not let `processPriceAlerts`'s move drift from its Step 6
-  confirm-write-before-push ordering — regression-sensitive, already-proven-in-
-  production logic.
+- Flag: goldprice.dev is new (launched May 2026) — if it turns out unreliable too,
+  don't reflexively reach for another 3rd-party gold API next; consider whether the
+  Binance fallback path even needs basis correction badly enough to justify a fourth
+  attempt, now that it's genuinely just a fallback-of-a-fallback behind MT4.
+- Flag: do not let `processGraphReminders` drift while editing around it in the same
+  file — unrelated, already-proven-in-production logic.
 
 ### Definition of Done
-- [ ] `deno check` clean on `mt4-webhook/index.ts` and `tick-fast/index.ts`.
-- [ ] `pnpm build`/`test`/`typecheck` pass (no-op regression check for existing
-      packages).
-- [ ] Local verification of all `mt4-webhook`/`tick-fast` behavior in Build Order
-      steps 3-4 actually performed and documented, not just "code looks right."
-- [ ] Migration file written and locally verified, not yet applied to the live
-      project (Arch does that after review).
-- [ ] MQL4 EA and VPS runbook written, explicitly flagged as unverified pending real
-      compilation/hardware — not claimed as tested when it isn't.
+- [ ] `deno check` clean on `tick/index.ts`, `tick-fast/index.ts`.
+- [ ] `pnpm build`/`test`/`typecheck` pass, new provider's tests included and green.
+- [ ] Local verification against a real live goldprice.dev + Binance call actually
+      performed and documented (not just unit-tested), confirming a real basis
+      write.
+- [ ] Deployed to production (`supabase functions deploy tick`) and confirmed via
+      the dashboard/DB that a real basis updates within one 2-minute cycle.
 
 ---
-
-## Builder Plan
-*Approved 2026-09-15 via plan mode — see
-`C:\Users\jychan\.claude\plans\this-is-my-project-nifty-mist.md` for the full plan
-this brief summarizes. Implemented directly in this session; see
-`handoff/BUILD-LOG.md`'s Step 11 entry for the verification story.*
