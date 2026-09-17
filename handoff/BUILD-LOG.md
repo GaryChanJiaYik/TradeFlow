@@ -5,7 +5,7 @@
 
 ## Current Status
 
-**Active step:** Step 12 — code-complete, locally verified with a real live goldprice.dev + Binance call, NOT yet deployed. Just needs `supabase functions deploy tick` (no migration).
+**Active step:** none — Step 12 DEPLOYED (2026-09-17). `tick` now calibrates against goldprice.dev instead of chartgoldprice.com; awaiting one production cycle's confirmation that a real basis updates (owner can check `select price_basis, price_basis_at from instruments where symbol = 'XAUUSD';`).
 **Last cleared:** Step 11 — 2026-09-17 (deployed and verified live).
 **Blocked on:** Step 11's real-world completion is gated on the owner: provisioning the GCP e2-micro VPS, compiling `mt4/TradeFlowMt4Bridge.mq4` for the first time, and the several GUI-only MT4 setup steps in `mt4/README.md` — none of which can be done from this session. The deployed Supabase-side code doesn't regress anything if the VPS/EA never materializes (falls back to today's Binance-only behavior).
 
@@ -131,8 +131,8 @@ after — no real project touched):**
 - Deleted the temporary local-verify file before finishing; `git status` confirmed
   only the intended files changed.
 
-Deploy: NOT deployed yet. No migration needed (reuses Step 9's `price_basis`/
-`price_basis_at` columns) — just `supabase functions deploy tick`.
+Deploy: DEPLOYED 2026-09-17 (`supabase functions deploy tick`, no migration needed —
+reuses Step 9's `price_basis`/`price_basis_at` columns).
 
 ---
 
